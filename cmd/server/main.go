@@ -64,6 +64,11 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// 启动即刷新一次 token + 签到 + 积分，避免 state.json 空时长期显示 0。
+	go func() {
+		sch.RunRefreshNow()
+		sch.RunCheckinNow()
+	}()
 	go sch.Run(ctx)
 
 	srv := &http.Server{

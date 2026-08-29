@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -47,14 +48,16 @@ type fakeUpstream struct {
 	claimCalls     atomic.Int32
 	refreshCalls   atomic.Int32
 	resourceRemain int64
+	verifyChecked  bool
 }
 
 func (f *fakeUpstream) server() *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/checkin_credits/status"):
-			f.checkinCalls.Add(1)
-			w.Write([]byte(`{"checked_in":false,"credits":200,"enable":true}`))
+			call := f.checkinCalls.Add(1)
+			checked := f.verifyChecked && call > 1
+			w.Write([]byte(`{"checked_in":` + jsonBool(checked) + `,"credits":200,"enable":true}`))
 		case strings.HasSuffix(r.URL.Path, "/checkin_credits/claim"):
 			f.claimCalls.Add(1)
 			w.Write([]byte(`{"code":0,"message":"success"}`))
@@ -71,6 +74,11 @@ func (f *fakeUpstream) server() *httptest.Server {
 }
 
 func jsonI64(v int64) string {
+	b, _ := json.Marshal(v)
+	return string(b)
+}
+
+func jsonBool(v bool) string {
 	b, _ := json.Marshal(v)
 	return string(b)
 }
@@ -93,7 +101,7 @@ func newTestScheduler(f *fakeUpstream, p *pool.Pool, srv *httptest.Server) *Sche
 }
 
 func TestRunCheckinReenablesCoolingAccount(t *testing.T) {
-	f := &fakeUpstream{resourceRemain: 500}
+	f := &fakeUpstream{resourceRemain: 500, verifyChecked: true}
 	srv := f.server()
 	defer srv.Close()
 
@@ -104,7 +112,7 @@ func TestRunCheckinReenablesCoolingAccount(t *testing.T) {
 
 	s := newTestScheduler(f, p, srv)
 	s.RunCheckinNow()
-	if f.checkinCalls.Load() != 1 {
+	if f.checkinCalls.Load() != 2 {
 		t.Errorf("checkin status calls=%d", f.checkinCalls.Load())
 	}
 	if f.claimCalls.Load() != 1 {
@@ -116,6 +124,29 @@ func TestRunCheckinReenablesCoolingAccount(t *testing.T) {
 	}
 	if st.Credits != 500 {
 		t.Errorf("credits=%d want 500", st.Credits)
+	}
+}
+
+func TestRunCheckinDoesNotLogSuccessWhenStatusDoesNotChange(t *testing.T) {
+	f := &fakeUpstream{resourceRemain: 500}
+	srv := f.server()
+	defer srv.Close()
+
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+
+	var logs strings.Builder
+	old := log.Writer()
+	log.SetOutput(&logs)
+	defer log.SetOutput(old)
+
+	s := newTestScheduler(f, p, srv)
+	s.RunCheckinNow()
+	if strings.Contains(logs.String(), "checkin u1: ok") {
+		t.Fatalf("false success log: %s", logs.String())
+	}
+	if !strings.Contains(logs.String(), "checkin verify u1") {
+		t.Fatalf("missing verification failure: %s", logs.String())
 	}
 }
 

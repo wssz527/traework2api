@@ -14,7 +14,8 @@ const existingFormat = `{
   "auth": {
     "accessToken": "at-placeholder", "refreshToken": "rt-placeholder", "expiresAt": 1786805537,
     "domain": "trae.cn", "apiHost": "https://api.trae.com.cn",
-    "machineId": "abcdef0123456789abcdef0123456789", "deviceId": "0123456789abcdef0123456789abcdef"
+    "machineId": "abcdef0123456789abcdef0123456789", "deviceId": "0123456789abcdef0123456789abcdef",
+    "checkinDeviceId": "1111222233334444", "checkinDeviceBrand": "Mac16,10", "checkinDeviceType": "mac"
   }
 }`
 
@@ -35,12 +36,15 @@ func TestParseExistingFormat(t *testing.T) {
 	if len(a.MachineID) != 32 || len(a.DeviceID) != 32 {
 		t.Errorf("ids: machine=%q device=%q", a.MachineID, a.DeviceID)
 	}
+	if a.CheckinDeviceID != "1111222233334444" || a.CheckinDeviceBrand != "Mac16,10" || a.CheckinDeviceType != "mac" {
+		t.Errorf("checkin device: id=%q brand=%q type=%q", a.CheckinDeviceID, a.CheckinDeviceBrand, a.CheckinDeviceType)
+	}
 }
 
 func TestParseFlat(t *testing.T) {
-	raw := []byte(`{"accessToken":"at","refreshToken":"rt","expiresAt":1753600000,"uid":"u2","nickname":"n2","machineId":"m1","deviceId":"d1"}`)
+	raw := []byte(`{"accessToken":"at","refreshToken":"rt","expiresAt":1753600000,"uid":"u2","nickname":"n2","machineId":"m1","deviceId":"d1","checkinDeviceId":"1111222233334444","checkinDeviceBrand":"90SB001GCD","checkinDeviceType":"windows"}`)
 	a, err := Parse(raw)
-	if err != nil || a.UID != "u2" || a.AccessToken != "at" || a.MachineID != "m1" || a.DeviceID != "d1" {
+	if err != nil || a.UID != "u2" || a.AccessToken != "at" || a.MachineID != "m1" || a.DeviceID != "d1" || a.CheckinDeviceID != "1111222233334444" || a.CheckinDeviceBrand != "90SB001GCD" || a.CheckinDeviceType != "windows" {
 		t.Fatalf("flat: %+v %v", a, err)
 	}
 }
@@ -60,7 +64,7 @@ func TestSaveAtomicRoundtripPreservesSOLOFields(t *testing.T) {
 	a := &Auth{
 		AccessToken: "at", RefreshToken: "rt", ExpiresAt: 1786805537,
 		Domain: "trae.cn", ApiHost: "https://api.trae.com.cn",
-		MachineID: "m123", DeviceID: "d456",
+		MachineID: "m123", DeviceID: "d456", CheckinDeviceID: "1111222233334444", CheckinDeviceBrand: "90SB001GCD", CheckinDeviceType: "windows",
 		UID: "u1", EnterpriseID: "e1", Nickname: "n1", FilePath: fp,
 	}
 	if err := a.SaveAtomic(); err != nil {
@@ -85,6 +89,9 @@ func TestSaveAtomicRoundtripPreservesSOLOFields(t *testing.T) {
 	}
 	if b.MachineID != "m123" || b.DeviceID != "d456" || b.ApiHost != "https://api.trae.com.cn" {
 		t.Errorf("SOLO fields lost: %+v", b)
+	}
+	if b.CheckinDeviceID != "1111222233334444" || b.CheckinDeviceBrand != "90SB001GCD" || b.CheckinDeviceType != "windows" {
+		t.Errorf("checkin device fields lost: %+v", b)
 	}
 }
 

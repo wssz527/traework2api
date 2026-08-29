@@ -101,8 +101,19 @@ func main() {
 				r.detail = short(err.Error())
 				failN++
 			} else {
-				r.status = "OK"
-				okN++
+				verified, _, _, err := up.CheckinStatus(a)
+				if err != nil {
+					r.status = "FAIL"
+					r.detail = "verify: " + short(err.Error())
+					failN++
+				} else if !verified {
+					r.status = "FAIL"
+					r.detail = "verify: status still unchecked"
+					failN++
+				} else {
+					r.status = "OK"
+					okN++
+				}
 			}
 		}
 		// 查积分

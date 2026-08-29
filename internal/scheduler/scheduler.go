@@ -105,7 +105,14 @@ func (s *Scheduler) RunCheckinNow() {
 			if err := s.cfg.Upstream.CheckinClaim(a); err != nil {
 				log.Printf("checkin claim %s: %v", st.UID, err)
 			} else {
-				log.Printf("checkin %s: ok", st.UID)
+				verified, _, _, err := s.cfg.Upstream.CheckinStatus(a)
+				if err != nil {
+					log.Printf("checkin verify %s: %v", st.UID, err)
+				} else if !verified {
+					log.Printf("checkin verify %s: status still unchecked", st.UID)
+				} else {
+					log.Printf("checkin %s: ok", st.UID)
+				}
 			}
 		} else if checkedIn {
 			log.Printf("checkin %s: already checked in", st.UID)
