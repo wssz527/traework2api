@@ -51,8 +51,14 @@ func UgHeaders(req *http.Request, a *auth.Auth) {
 	req.Header.Set("User-Agent", clientUA)
 	req.Header.Set("Authorization", "Cloud-IDE-JWT "+a.JWT()) // 读锁快照
 	req.Header.Set("X-User-Region", "CN")
-	if a.DeviceID != "" {
-		req.Header.Set("X-Device-Id", a.DeviceID)
+	if a.CheckinDeviceID != "" {
+		req.Header.Set("X-Device-Id", a.CheckinDeviceID)
+	}
+	if a.CheckinDeviceBrand != "" {
+		req.Header.Set("X-Device-Brand", a.CheckinDeviceBrand)
+	}
+	if a.CheckinDeviceType != "" {
+		req.Header.Set("X-Device-Type", a.CheckinDeviceType)
 	}
 }
 

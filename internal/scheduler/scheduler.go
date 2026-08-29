@@ -98,17 +98,31 @@ func (s *Scheduler) RunCheckinNow() {
 			continue
 		}
 		// 签到（status → 未签到则 claim）
-		checkedIn, _, enable, err := s.cfg.Upstream.CheckinStatus(a)
-		if err != nil {
-			log.Printf("checkin status %s: %v", st.UID, err)
-		} else if !checkedIn && enable {
-			if err := s.cfg.Upstream.CheckinClaim(a); err != nil {
-				log.Printf("checkin claim %s: %v", st.UID, err)
-			} else {
-				log.Printf("checkin %s: ok", st.UID)
+		if a.CheckinDeviceID == "" {
+			// 凭证缺少独立签到设备标识：多账号签到要求各账号使用不同的
+			// 设备 ID，缺字段时明确跳过并说明，不发无设备头的无效请求，
+			// 也不生成随机假 ID（上游无法识别，签到永远不会生效）。
+			log.Printf("checkin %s: skip, missing checkinDeviceId（签到需独立设备ID，多账号须各不相同；请重新导入含 checkinDeviceId/checkinDeviceBrand/checkinDeviceType 的凭证）", st.UID)
+		} else {
+			checkedIn, _, enable, err := s.cfg.Upstream.CheckinStatus(a)
+			if err != nil {
+				log.Printf("checkin status %s: %v", st.UID, err)
+			} else if !checkedIn && enable {
+				if err := s.cfg.Upstream.CheckinClaim(a); err != nil {
+					log.Printf("checkin claim %s: %v", st.UID, err)
+				} else {
+					verified, _, _, err := s.cfg.Upstream.CheckinStatus(a)
+					if err != nil {
+						log.Printf("checkin verify %s: %v", st.UID, err)
+					} else if !verified {
+						log.Printf("checkin verify %s: status still unchecked", st.UID)
+					} else {
+						log.Printf("checkin %s: ok", st.UID)
+					}
+				}
+			} else if checkedIn {
+				log.Printf("checkin %s: already checked in", st.UID)
 			}
-		} else if checkedIn {
-			log.Printf("checkin %s: already checked in", st.UID)
 		}
 		// 查积分 + 解冻
 		remain, err := s.cfg.Upstream.UserEntUsage(a)

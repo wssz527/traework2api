@@ -22,17 +22,20 @@ import (
 type Auth struct {
 	mu sync.RWMutex
 
-	AccessToken  string // Cloud-IDE-JWT 头用
-	RefreshToken string // 每次 ExchangeToken 轮换
-	ExpiresAt    int64  // Unix 秒（accessToken 过期时刻）
-	Domain       string // "trae.cn"
-	ApiHost      string // "https://api.trae.com.cn"（ExchangeToken host）
-	MachineID    string // x-machine-id
-	DeviceID     string // x-device-id
-	UID          string
-	EnterpriseID string
-	Nickname     string
-	FilePath     string // 落盘路径；refresh 后原子写回
+	AccessToken        string // Cloud-IDE-JWT 头用
+	RefreshToken       string // 每次 ExchangeToken 轮换
+	ExpiresAt          int64  // Unix 秒（accessToken 过期时刻）
+	Domain             string // "trae.cn"
+	ApiHost            string // "https://api.trae.com.cn"（ExchangeToken host）
+	MachineID          string // 模型通道 x-machine-id
+	DeviceID           string // 模型通道 x-device-id
+	CheckinDeviceID    string // 签到 x-device-id
+	CheckinDeviceBrand string // 签到 x-device-brand
+	CheckinDeviceType  string // 签到 x-device-type
+	UID                string
+	EnterpriseID       string
+	Nickname           string
+	FilePath           string // 落盘路径；refresh 后原子写回
 }
 
 // Lock 供同进程内其他包（upstream.RefreshToken）在改写 Auth 字段期间加写锁。
@@ -82,13 +85,16 @@ func (a *Auth) NeedsRefreshLocked(within time.Duration) bool {
 func parseNested(raw []byte) (*Auth, error) {
 	var n struct {
 		Auth struct {
-			AccessToken  string `json:"accessToken"`
-			RefreshToken string `json:"refreshToken"`
-			ExpiresAt    int64  `json:"expiresAt"`
-			Domain       string `json:"domain"`
-			ApiHost      string `json:"apiHost"`
-			MachineID    string `json:"machineId"`
-			DeviceID     string `json:"deviceId"`
+			AccessToken        string `json:"accessToken"`
+			RefreshToken       string `json:"refreshToken"`
+			ExpiresAt          int64  `json:"expiresAt"`
+			Domain             string `json:"domain"`
+			ApiHost            string `json:"apiHost"`
+			MachineID          string `json:"machineId"`
+			DeviceID           string `json:"deviceId"`
+			CheckinDeviceID    string `json:"checkinDeviceId"`
+			CheckinDeviceBrand string `json:"checkinDeviceBrand"`
+			CheckinDeviceType  string `json:"checkinDeviceType"`
 		} `json:"auth"`
 		Account struct {
 			UID          string `json:"uid"`
@@ -100,16 +106,19 @@ func parseNested(raw []byte) (*Auth, error) {
 		return nil, fmt.Errorf("storage_parse_error: %w", err)
 	}
 	return &Auth{
-		AccessToken:  n.Auth.AccessToken,
-		RefreshToken: n.Auth.RefreshToken,
-		ExpiresAt:    n.Auth.ExpiresAt,
-		Domain:       n.Auth.Domain,
-		ApiHost:      n.Auth.ApiHost,
-		MachineID:    n.Auth.MachineID,
-		DeviceID:     n.Auth.DeviceID,
-		UID:          n.Account.UID,
-		EnterpriseID: n.Account.EnterpriseID,
-		Nickname:     n.Account.Nickname,
+		AccessToken:        n.Auth.AccessToken,
+		RefreshToken:       n.Auth.RefreshToken,
+		ExpiresAt:          n.Auth.ExpiresAt,
+		Domain:             n.Auth.Domain,
+		ApiHost:            n.Auth.ApiHost,
+		MachineID:          n.Auth.MachineID,
+		DeviceID:           n.Auth.DeviceID,
+		CheckinDeviceID:    n.Auth.CheckinDeviceID,
+		CheckinDeviceBrand: n.Auth.CheckinDeviceBrand,
+		CheckinDeviceType:  n.Auth.CheckinDeviceType,
+		UID:                n.Account.UID,
+		EnterpriseID:       n.Account.EnterpriseID,
+		Nickname:           n.Account.Nickname,
 	}, nil
 }
 
@@ -118,31 +127,37 @@ func parseNested(raw []byte) (*Auth, error) {
 //	{"accessToken":...,"uid":...,"machineId":...,"deviceId":...}
 func parseFlat(raw []byte) (*Auth, error) {
 	var f struct {
-		AccessToken  string `json:"accessToken"`
-		RefreshToken string `json:"refreshToken"`
-		ExpiresAt    int64  `json:"expiresAt"`
-		Domain       string `json:"domain"`
-		ApiHost      string `json:"apiHost"`
-		MachineID    string `json:"machineId"`
-		DeviceID     string `json:"deviceId"`
-		UID          string `json:"uid"`
-		EnterpriseID string `json:"enterpriseId"`
-		Nickname     string `json:"nickname"`
+		AccessToken        string `json:"accessToken"`
+		RefreshToken       string `json:"refreshToken"`
+		ExpiresAt          int64  `json:"expiresAt"`
+		Domain             string `json:"domain"`
+		ApiHost            string `json:"apiHost"`
+		MachineID          string `json:"machineId"`
+		DeviceID           string `json:"deviceId"`
+		CheckinDeviceID    string `json:"checkinDeviceId"`
+		CheckinDeviceBrand string `json:"checkinDeviceBrand"`
+		CheckinDeviceType  string `json:"checkinDeviceType"`
+		UID                string `json:"uid"`
+		EnterpriseID       string `json:"enterpriseId"`
+		Nickname           string `json:"nickname"`
 	}
 	if err := json.Unmarshal(raw, &f); err != nil {
 		return nil, fmt.Errorf("storage_parse_error: %w", err)
 	}
 	return &Auth{
-		AccessToken:  f.AccessToken,
-		RefreshToken: f.RefreshToken,
-		ExpiresAt:    f.ExpiresAt,
-		Domain:       f.Domain,
-		ApiHost:      f.ApiHost,
-		MachineID:    f.MachineID,
-		DeviceID:     f.DeviceID,
-		UID:          f.UID,
-		EnterpriseID: f.EnterpriseID,
-		Nickname:     f.Nickname,
+		AccessToken:        f.AccessToken,
+		RefreshToken:       f.RefreshToken,
+		ExpiresAt:          f.ExpiresAt,
+		Domain:             f.Domain,
+		ApiHost:            f.ApiHost,
+		MachineID:          f.MachineID,
+		DeviceID:           f.DeviceID,
+		CheckinDeviceID:    f.CheckinDeviceID,
+		CheckinDeviceBrand: f.CheckinDeviceBrand,
+		CheckinDeviceType:  f.CheckinDeviceType,
+		UID:                f.UID,
+		EnterpriseID:       f.EnterpriseID,
+		Nickname:           f.Nickname,
 	}, nil
 }
 
@@ -191,13 +206,16 @@ func (a *Auth) saveAtomicLocked() error {
 	}
 	doc := map[string]any{
 		"auth": map[string]any{
-			"accessToken":  a.AccessToken,
-			"refreshToken": a.RefreshToken,
-			"expiresAt":    a.ExpiresAt,
-			"domain":       a.Domain,
-			"apiHost":      a.ApiHost,
-			"machineId":    a.MachineID,
-			"deviceId":     a.DeviceID,
+			"accessToken":        a.AccessToken,
+			"refreshToken":       a.RefreshToken,
+			"expiresAt":          a.ExpiresAt,
+			"domain":             a.Domain,
+			"apiHost":            a.ApiHost,
+			"machineId":          a.MachineID,
+			"deviceId":           a.DeviceID,
+			"checkinDeviceId":    a.CheckinDeviceID,
+			"checkinDeviceBrand": a.CheckinDeviceBrand,
+			"checkinDeviceType":  a.CheckinDeviceType,
 		},
 		"account": map[string]any{
 			"uid":          a.UID,

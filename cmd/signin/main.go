@@ -75,34 +75,55 @@ func main() {
 		}
 
 		// 签到
-		checkedIn, _, enable, serr := up.CheckinStatus(a)
-		switch {
-		case serr != nil:
-			if isAlready(serr.Error()) {
-				r.status = "ALREADY"
-				r.detail = short(serr.Error())
-				alreadyN++
-			} else {
-				r.status = "FAIL"
-				r.detail = short(serr.Error())
-				failN++
-			}
-		case checkedIn:
-			r.status = "ALREADY"
-			r.detail = "already checked in"
-			alreadyN++
-		case !enable:
+		if a.CheckinDeviceID == "" {
+			// 凭证缺少独立签到设备标识：签到请求必须带与模型通道不同的
+			// 设备标识，且多账号之间必须各不相同（相同会被上游关联）。
+			// 这里明确报 FAIL 并说明原因，不发无设备头的无效请求，
+			// 也不生成随机假 ID（上游无法识别，签到永远不会生效）。
 			r.status = "FAIL"
-			r.detail = "checkin disabled"
+			r.detail = "missing checkinDeviceId: 签到需独立设备ID（多账号须各不相同），请重新导入含 checkinDeviceId/checkinDeviceBrand/checkinDeviceType 的凭证"
 			failN++
-		default:
-			if err := up.CheckinClaim(a); err != nil {
+		} else {
+			checkedIn, _, enable, serr := up.CheckinStatus(a)
+			switch {
+			case serr != nil:
+				if isAlready(serr.Error()) {
+					r.status = "ALREADY"
+					r.detail = short(serr.Error())
+					alreadyN++
+				} else {
+					r.status = "FAIL"
+					r.detail = short(serr.Error())
+					failN++
+				}
+			case checkedIn:
+				r.status = "ALREADY"
+				r.detail = "already checked in"
+				alreadyN++
+			case !enable:
 				r.status = "FAIL"
-				r.detail = short(err.Error())
+				r.detail = "checkin disabled"
 				failN++
-			} else {
-				r.status = "OK"
-				okN++
+			default:
+				if err := up.CheckinClaim(a); err != nil {
+					r.status = "FAIL"
+					r.detail = short(err.Error())
+					failN++
+				} else {
+					verified, _, _, err := up.CheckinStatus(a)
+					if err != nil {
+						r.status = "FAIL"
+						r.detail = "verify: " + short(err.Error())
+						failN++
+					} else if !verified {
+						r.status = "FAIL"
+						r.detail = "verify: status still unchecked"
+						failN++
+					} else {
+						r.status = "OK"
+						okN++
+					}
+				}
 			}
 		}
 		// 查积分
