@@ -81,6 +81,40 @@ go build -o tw2api ./cmd/server
 ./credit.sh <uid>       # 指定账号
 ```
 
+## 签到设备ID
+
+签到接口要求请求头携带**独立设备三件套**（`x-device-id` / `x-device-brand` /
+`x-device-type`），与模型通道的 `machineId`/`deviceId` 不是同一组；且**多账号
+必须各不相同**，共用同一设备 ID 会被上游关联。凭证字段为 auth 段的
+`checkinDeviceId` / `checkinDeviceBrand` / `checkinDeviceType`。
+
+**自动获取（默认，推荐）**：`signin.sh` 或自动签到调度器发现凭证缺
+`checkinDeviceId` 时，会自动从**本机已登录的 TRAE SOLO 官方客户端**本地数据
+读取设备标识（macOS / Windows），并写回凭证文件，之后容器内调度器直接复用。
+可用 `TW2A_DISABLE_CHECKIN_DETECT=1` 关闭该探测。
+
+**手动获取**（账号的官方客户端登录在**另一台设备**上时，需到那台设备上取）：
+
+```bash
+# macOS（在那台设备上执行）：
+strings ~/Library/Application\ Support/TRAE\ SOLO\ CN/Local\ Storage/leveldb/*.log \
+  | grep -o '"user_unique_id":"[0-9]*"' | tail -1   # → checkinDeviceId
+sysctl -n hw.model                                   # → checkinDeviceBrand
+# checkinDeviceType 填 "mac"
+```
+
+```powershell
+# Windows PowerShell（在那台设备上执行）：
+Get-ChildItem "$env:APPDATA\TRAE SOLO CN\Local Storage\leveldb" -Include *.log,*.ldb -Recurse |
+  Select-String '"user_unique_id":"(\d+)"' | Select-Object -Last 1  # → checkinDeviceId
+(Get-CimInstance Win32_BaseBoard).Product                            # → checkinDeviceBrand
+# checkinDeviceType 填 "windows"
+```
+
+把三个值填进 `auths/trae-<uid>.json` 的 `auth` 段即可。既无本机客户端、
+凭证也缺字段时，签到会被**明确跳过并打印原因**——不会发无设备头的无效请求，
+也不会生成上游无法识别的随机假 ID。
+
 ## 目录结构
 
 ```

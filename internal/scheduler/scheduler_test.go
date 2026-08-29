@@ -150,9 +150,10 @@ func TestRunCheckinDoesNotLogSuccessWhenStatusDoesNotChange(t *testing.T) {
 	}
 }
 
-// 凭证缺 checkinDeviceId 时必须跳过签到并打印明确提示，
-// 不发无设备头的无效请求，也不生成随机假 ID。
+// 凭证缺 checkinDeviceId 且无法从本机官方客户端自动读取时，
+// 必须跳过签到并打印明确提示，不发无设备头的无效请求，也不生成随机假 ID。
 func TestRunCheckinSkipsMissingCheckinDeviceID(t *testing.T) {
+	t.Setenv("TW2A_DISABLE_CHECKIN_DETECT", "1") // 隔离本机官方客户端数据，保持用例 hermetic
 	f := &fakeUpstream{resourceRemain: 500}
 	srv := f.server()
 	defer srv.Close()
@@ -171,7 +172,7 @@ func TestRunCheckinSkipsMissingCheckinDeviceID(t *testing.T) {
 		t.Errorf("no upstream checkin calls expected, status=%d claim=%d",
 			f.checkinCalls.Load(), f.claimCalls.Load())
 	}
-	if !strings.Contains(logs.String(), "missing checkinDeviceId") {
+	if !strings.Contains(logs.String(), "缺签到设备ID") {
 		t.Fatalf("missing skip hint: %s", logs.String())
 	}
 }
