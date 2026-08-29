@@ -1,12 +1,15 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"traework2api/internal/auth"
 	"traework2api/internal/pool"
@@ -89,7 +92,7 @@ func TestChatNonStreamAggregates(t *testing.T) {
 	}
 }
 
-func TestChatStreamPassthrough(t *testing.T) {
+func TestChatStreamConvertsLegacySOLOToOpenAI(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 200, soloSSE, true
 	})
@@ -107,8 +110,59 @@ func TestChatStreamPassthrough(t *testing.T) {
 		t.Errorf("ct=%q", ct)
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, "你好") || !strings.Contains(body, "data: [DONE]") {
+	if strings.Contains(body, "event:output") {
+		t.Errorf("SOLO event leaked to OpenAI client: %q", body)
+	}
+	if !strings.Contains(body, `data: {"`) ||
+		!strings.Contains(body, `"object":"chat.completion.chunk"`) ||
+		!strings.Contains(body, `"content":"你好"`) ||
+		!strings.Contains(body, "data: [DONE]\n\n") {
 		t.Errorf("body=%q", body)
+	}
+}
+
+func TestWriteRemoteReplyFormatsOpenAISSE(t *testing.T) {
+	h := &Handler{}
+	rec := httptest.NewRecorder()
+
+	startRemoteStream(rec)
+	h.writeRemoteReply(rec, true, "glm-5.3", "OK")
+
+	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "text/event-stream") {
+		t.Fatalf("content-type=%q", ct)
+	}
+	frames := strings.Split(strings.TrimSuffix(rec.Body.String(), "\n\n"), "\n\n")
+	if len(frames) != 3 {
+		t.Fatalf("frames=%d body=%q", len(frames), rec.Body.String())
+	}
+	for i, frame := range frames[:2] {
+		if !strings.HasPrefix(frame, "data: ") {
+			t.Errorf("frame %d is not SSE data: %q", i, frame)
+			continue
+		}
+		var chunk map[string]any
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(frame, "data: ")), &chunk); err != nil {
+			t.Errorf("frame %d is not JSON: %v", i, err)
+		}
+		if chunk["object"] != "chat.completion.chunk" {
+			t.Errorf("frame %d object=%v", i, chunk["object"])
+		}
+	}
+	if frames[2] != "data: [DONE]" {
+		t.Errorf("last frame=%q", frames[2])
+	}
+}
+
+func TestRemotePromptPreservesStructuredOpenAIMessages(t *testing.T) {
+	body := []byte(`{"messages":[
+		{"role":"system","content":"规则"},
+		{"role":"user","content":[{"type":"text","text":"只回复 OK"}]},
+		{"role":"user","content":[{"type":"text","text":"<system-reminder>日期</system-reminder>"}]}
+	]}`)
+	want := "system:\n规则\n\nuser:\n只回复 OK\n\nuser:\n<system-reminder>日期</system-reminder>"
+
+	if got := remotePrompt(body); got != want {
+		t.Errorf("prompt=%q want=%q", got, want)
 	}
 }
 
@@ -341,3 +395,258 @@ func TestHealthz(t *testing.T) {
 		t.Errorf("code=%d", rec.Code)
 	}
 }
+
+func TestChatGLM53RoutesThroughRemoteSession(t *testing.T) {
+	var gotPaths []string
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			gotPaths = append(gotPaths, r.Method+" "+r.URL.Path)
+			switch {
+			case r.Method == http.MethodPost && r.URL.Path == "/api/remote/v1/chat_sessions":
+				return jsonHTTPResponse(200, `{"code":0,"data":{"chat_session_id":"s1"}}`), nil
+			case r.Method == http.MethodPost && r.URL.Path == "/api/remote/v1/chat_sessions/s1/messages":
+				return jsonHTTPResponse(200, `{"code":0,"data":{"message_id":"m1","accepted":true}}`), nil
+			case r.Method == http.MethodGet && r.URL.Path == "/api/remote/v1/chat_sessions/s1/messages":
+				return jsonHTTPResponse(200, `{"code":0,"data":{"items":[{"role":"assistant","status":"completed","content":"OK"}]}}`), nil
+			case r.Method == http.MethodDelete && r.URL.Path == "/api/remote/v1/chat_sessions/s1":
+				return jsonHTTPResponse(200, `{"code":0,"message":"success"}`), nil
+			default:
+				t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+				return nil, nil
+			}
+		})},
+		AgentHost: "https://fake.example",
+		UgHost:    "https://fake.example",
+		OAuthHost: "https://fake.example",
+		ClientID:  upstream.ClientID,
+	}
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: up,
+	})
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.3","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	wantPaths := []string{
+		"POST /api/remote/v1/chat_sessions",
+		"POST /api/remote/v1/chat_sessions/s1/messages",
+		"GET /api/remote/v1/chat_sessions/s1/messages",
+		"DELETE /api/remote/v1/chat_sessions/s1",
+	}
+	if strings.Join(gotPaths, "\n") != strings.Join(wantPaths, "\n") {
+		t.Errorf("paths=%v want=%v", gotPaths, wantPaths)
+	}
+	if body := rec.Body.String(); !strings.Contains(body, `"content":"OK"`) || !strings.Contains(body, "data: [DONE]\n\n") {
+		t.Errorf("stream body=%q", body)
+	}
+}
+
+func remoteTestHook() (restore func()) {
+	oldWait, oldKeep, oldBusy := remoteWaitTotal, remoteKeepaliveInterval, remoteBusyRetryWait
+	remoteWaitTotal, remoteKeepaliveInterval, remoteBusyRetryWait = 200*time.Millisecond, 20*time.Millisecond, 10*time.Millisecond
+	return func() { remoteWaitTotal, remoteKeepaliveInterval, remoteBusyRetryWait = oldWait, oldKeep, oldBusy }
+}
+
+// TestChatRemoteStreamTimeoutEmitsKeepaliveAndError 任务迟迟不完成时：
+
+func TestChatRemoteStreamTimeoutEmitsKeepaliveAndError(t *testing.T) {
+	restore := remoteTestHook()
+	defer restore()
+	var creates, deletes int
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			switch {
+			case r.Method == http.MethodPost && r.URL.Path == "/api/remote/v1/chat_sessions":
+				creates++
+				return jsonHTTPResponse(200, `{"code":0,"data":{"chat_session_id":"s1"}}`), nil
+			case r.Method == http.MethodPost && r.URL.Path == "/api/remote/v1/chat_sessions/s1/messages":
+				return jsonHTTPResponse(200, `{"code":0,"data":{"message_id":"m1","accepted":true}}`), nil
+			case r.Method == http.MethodGet && r.URL.Path == "/api/remote/v1/chat_sessions/s1/messages":
+				return jsonHTTPResponse(200, `{"code":0,"data":{"items":[{"role":"user","status":"in_progress"}]}}`), nil
+			case r.Method == http.MethodDelete && r.URL.Path == "/api/remote/v1/chat_sessions/s1":
+				deletes++
+				return jsonHTTPResponse(200, `{"code":0,"message":"success"}`), nil
+			default:
+				t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+				return nil, nil
+			}
+		})},
+		AgentHost: "https://fake.example",
+		UgHost:    "https://fake.example",
+		OAuthHost: "https://fake.example",
+		ClientID:  upstream.ClientID,
+	}
+	p := testPoolWith(
+		&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999},
+	)
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.3","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if creates != 1 || deletes != 1 {
+		t.Errorf("creates=%d deletes=%d want 1/1（超时不得换号重发）", creates, deletes)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, ": keepalive") {
+		t.Errorf("stream should contain keepalive comments: %q", body)
+	}
+	if !strings.Contains(body, "remote_task_failed") || !strings.Contains(body, "data: [DONE]\n\n") {
+		t.Errorf("stream should end with error frame + DONE: %q", body)
+	}
+}
+
+// TestChatRemoteBusyRetriesThenRotates 发消息遇 429 并发槽满：
+
+func TestChatRemoteBusyRetriesThenRotates(t *testing.T) {
+	restore := remoteTestHook()
+	defer restore()
+	var creates int
+	var sends int
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			switch {
+			case r.Method == http.MethodPost && r.URL.Path == "/api/remote/v1/chat_sessions":
+				creates++
+				return jsonHTTPResponse(200, fmt.Sprintf(`{"code":0,"data":{"chat_session_id":"s%d"}}`, creates)), nil
+			case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/messages"):
+				sends++
+				return jsonHTTPResponse(429, `{"code":991502,"error":{"reason":"solo_agent_parallel_limit","limit":2,"running":2},"message":"solo agent parallel limit reached"}`), nil
+			case r.Method == http.MethodDelete:
+				return jsonHTTPResponse(200, `{"code":0,"message":"success"}`), nil
+			default:
+				t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+				return nil, nil
+			}
+		})},
+		AgentHost: "https://fake.example",
+		UgHost:    "https://fake.example",
+		OAuthHost: "https://fake.example",
+		ClientID:  upstream.ClientID,
+	}
+	p := testPoolWith(
+		&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999},
+	)
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.3","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != 503 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if creates != 2 { // 每账号一个会话
+		t.Errorf("creates=%d want 2", creates)
+	}
+	if sends != 6 { // 每会话 3 次发送重试 × 2 账号
+		t.Errorf("sends=%d want 6", sends)
+	}
+	st, _ := p.Status("u1")
+	if st.ErrCount != 0 {
+		t.Errorf("busy 不应累计账号错误: %+v", st)
+	}
+}
+
+// TestChatRemoteClientDisconnectCleansSession 客户端断开后应停止轮询并删除会话，
+
+func TestChatRemoteClientDisconnectCleansSession(t *testing.T) {
+	restore := remoteTestHook()
+	defer restore()
+	var deletes int
+	done := make(chan struct{})
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			switch {
+			case r.Method == http.MethodPost && r.URL.Path == "/api/remote/v1/chat_sessions":
+				return jsonHTTPResponse(200, `{"code":0,"data":{"chat_session_id":"s1"}}`), nil
+			case r.Method == http.MethodPost && r.URL.Path == "/api/remote/v1/chat_sessions/s1/messages":
+				return jsonHTTPResponse(200, `{"code":0,"data":{"message_id":"m1","accepted":true}}`), nil
+			case r.Method == http.MethodGet && r.URL.Path == "/api/remote/v1/chat_sessions/s1/messages":
+				return jsonHTTPResponse(200, `{"code":0,"data":{"items":[{"role":"user","status":"in_progress"}]}}`), nil
+			case r.Method == http.MethodDelete && r.URL.Path == "/api/remote/v1/chat_sessions/s1":
+				deletes++
+				return jsonHTTPResponse(200, `{"code":0,"message":"success"}`), nil
+			default:
+				t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+				return nil, nil
+			}
+		})},
+		AgentHost: "https://fake.example",
+		UgHost:    "https://fake.example",
+		OAuthHost: "https://fake.example",
+		ClientID:  upstream.ClientID,
+	}
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: up,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.3","stream":true,"messages":[{"role":"user","content":"hi"}]}`)).WithContext(ctx)
+	rec := httptest.NewRecorder()
+	go func() {
+		h.ServeHTTP(rec, req)
+		close(done)
+	}()
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler did not return after client disconnect")
+	}
+	if deletes != 1 {
+		t.Errorf("deletes=%d want 1（断开后必须删除会话释放并发槽）", deletes)
+	}
+}
+
+func jsonHTTPResponse(status int, body string) *http.Response {
+	return &http.Response{
+		StatusCode: status,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+}
+
+func TestChatDeepSeekStaysOnLegacyChannel(t *testing.T) {
+	gotPath := ""
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			gotPath = r.URL.Path
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(soloSSE)),
+			}, nil
+		})},
+		AgentHost: "https://fake.example",
+		UgHost:    "https://fake.example",
+		OAuthHost: "https://fake.example",
+		ClientID:  upstream.ClientID,
+	}
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: up,
+	})
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"DeepSeek-V4-Flash-Official","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if gotPath != "/api/agent/v3/llm_utils_chat" {
+		t.Errorf("DeepSeek should stay on llm_utils_chat, got path=%q", gotPath)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 本地 Work 通道接线（tools_local:true 触发）
+// ---------------------------------------------------------------------------
