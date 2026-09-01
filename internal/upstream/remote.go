@@ -19,7 +19,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -89,6 +91,14 @@ const RemoteEpMessages = "/api/remote/v1/chat_sessions/%s/messages"
 // deviceID/machineID/UID 运行时从账号凭证注入（服务端按设备身份校验）。
 // icube_main_uid / workspace_id 为客户端本地状态，无凭证来源，用占位值：
 // 上游若严格校验需按抓包自行填入，否则保持占位即可正常工作。
+func firstN(s string, n int) string {
+	r := []rune(s)
+	if len(r) > n {
+		return string(r[:n])
+	}
+	return s
+}
+
 func RemoteCommonParams(a *auth.Auth) string {
 	cp := map[string]any{
 		"icube_uid": a.UID, "user_id": a.UID, "biz_user_id": a.UID,
@@ -174,6 +184,9 @@ func (c *Client) RemoteCreateSession(a *auth.Auth) (string, error) {
 // Max 模式，逆向结论 2026-08-31：Max 开关只改这一个字段），否则保持模板
 // 原样 "manual"。
 func (c *Client) RemoteSendMessage(a *auth.Auth, sessionID, model, userText string, maxMode bool) (string, error) {
+	if os.Getenv("TW2API_DIAG_SEND") != "" {
+		log.Printf("DIAG send sess=%s model=%s textLen=%d head=%q", sessionID, model, len(userText), firstN(userText, 200))
+	}
 	// base64 模板解码 + 替换模型名
 	tplBytes, err := base64.StdEncoding.DecodeString(RemoteMsgTemplateB64)
 	if err != nil {
@@ -239,8 +252,10 @@ func (c *Client) RemoteSendMessage(a *auth.Auth, sessionID, model, userText stri
 // timeout 为最大等待时长；ctx 取消（客户端断开）时立即返回 ctx.Err()。
 func (c *Client) RemoteWaitAndRead(ctx context.Context, a *auth.Auth, sessionID string, timeout time.Duration) (string, error) {
 	deadline := time.Now().Add(timeout)
+	stalled := 0 // 连续无进展轮询次数（消息数/最新状态不变）
+	var lastProg string
 	for time.Now().Before(deadline) {
-		req, err := http.NewRequest(http.MethodGet,
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet,
 			remoteHostURL()+fmt.Sprintf(RemoteEpMessages, sessionID)+"?page_size=20", nil)
 		if err != nil {
 			return "", err
@@ -248,6 +263,10 @@ func (c *Client) RemoteWaitAndRead(ctx context.Context, a *auth.Auth, sessionID 
 		RemoteHeaders(req, a)
 		resp, err := c.HTTP.Do(req)
 		if err != nil {
+			// 客户端已断开（ctx 取消）：立即返回，停止空轮询并释放并发槽。
+			if ctx.Err() != nil {
+				return "", ctx.Err()
+			}
 			time.Sleep(2 * time.Second)
 			continue
 		}
@@ -278,6 +297,22 @@ func (c *Client) RemoteWaitAndRead(ctx context.Context, a *auth.Auth, sessionID 
 			}
 			if best != nil {
 				return extractAssistantText(best.Content), nil
+			}
+			// 卡死检测：消息数 + 最新状态 连续 20 次无变化（约 1 分钟）→ 判定任务卡死，
+			// 提前放弃而非傻等 15 分钟（实测 session_066c213e 云端卡 28 分钟）。
+			prog := fmt.Sprintf("n=%d", len(out.Data.Items))
+			if len(out.Data.Items) > 0 {
+				last := out.Data.Items[len(out.Data.Items)-1]
+				prog = fmt.Sprintf("n=%d last=%s/%s", len(out.Data.Items), last.Role, last.Status)
+			}
+			if prog == lastProg {
+				stalled++
+				if stalled >= 20 {
+					return "", fmt.Errorf("%w: no progress after ~1min (%s)", ErrRemoteTimeout, prog)
+				}
+			} else {
+				lastProg = prog
+				stalled = 0
 			}
 		}
 		select {
