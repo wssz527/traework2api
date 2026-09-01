@@ -96,6 +96,9 @@ func NewHandler(cfg Config) *Handler {
 		h.convs = newConvStore(fp)
 	}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
+	// Anthropic Messages API 兼容端点：让 Claude Code 等 Anthropic 协议客户端
+	// 接入 trae 云端沙盒（复用会话注册表/账号池/serveRemoteWith）。
+	h.mux.HandleFunc("POST /v1/messages", h.withAuth(h.serveMessages))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
@@ -717,6 +720,79 @@ func messageText(content any) string {
 	return strings.Join(texts, "")
 }
 
+// remoteRenderer 把 remote 通道的增量与终态渲染成具体协议帧（OpenAI / Anthropic）。
+// 由 serveRemotePumpWith 在各写点调用；实现必须保证流式 content block 成对
+//（start→delta→stop），协议适配由各实现负责。
+type remoteRenderer interface {
+	// streamStart 在 SSE 响应头发出后产生协议首帧。
+	streamStart(w io.Writer, id, model string, created int64)
+	// delta 渲染一条云端事件增量（reasoning/content/tool_call/tool_result）。
+	delta(w io.Writer, id, model string, created int64, d upstream.RemoteEventDelta)
+	// text 渲染一段普通增量文本（本地 MCP 工具事件等）。
+	text(w io.Writer, id, model string, created int64, text string)
+	// streamErr 渲染流式错误终帧（含帧终结符）。status 供协议错误类型映射。
+	streamErr(w io.Writer, status int, code, msg string)
+	// streamFinish 渲染流式成功终帧（收尾正文 + 结束标记）。
+	streamFinish(w io.Writer, id, model string, created int64, replyText string)
+	// nonStream 渲染非流式完整响应。
+	nonStream(w http.ResponseWriter, model string, replyText string)
+}
+
+// openaiRenderer 把增量渲染成 OpenAI 流式 chunk / 完整响应。
+// 字节内容与调用旧 writeChatChunk/writeRemoteDelta 完全一致。
+type openaiRenderer struct{}
+
+func (openaiRenderer) streamStart(w io.Writer, id, model string, created int64) {
+	writeChatChunk(w, id, created, model, "assistant", "", nil)
+}
+
+func (openaiRenderer) delta(w io.Writer, id, model string, created int64, d upstream.RemoteEventDelta) {
+	writeRemoteDelta(w, id, created, model, d)
+}
+
+func (openaiRenderer) text(w io.Writer, id, model string, created int64, text string) {
+	writeChatChunk(w, id, created, model, "", text, nil)
+}
+
+func (openaiRenderer) streamErr(w io.Writer, status int, code, msg string) {
+	// 错误码恒为 remote_task_failed（历史行为，测试断言依赖它）。
+	_ = code
+	errPayload, _ := json.Marshal(map[string]any{
+		"error": map[string]any{"message": msg, "type": "api_error", "code": "remote_task_failed"},
+	})
+	fmt.Fprintf(w, "data: %s\n\n", errPayload)
+	w.Write([]byte("data: [DONE]\n\n"))
+}
+
+func (openaiRenderer) streamFinish(w io.Writer, id, model string, created int64, replyText string) {
+	writeChatChunk(w, id, created, model, "", "\n\n---\n\n", nil)
+	writeChatChunk(w, id, created, model, "", replyText, nil)
+	writeChatChunk(w, id, created, model, "", "", "stop")
+	fmt.Fprint(w, "data: [DONE]\n\n")
+}
+
+func (openaiRenderer) nonStream(w http.ResponseWriter, model, replyText string) {
+	w.Header().Set("Content-Type", "application/json")
+	writeOpenAICompletion(w, model, replyText)
+}
+
+// writeOpenAICompletion 渲染非流式 OpenAI chat.completion 响应体。
+// （供 writeRemoteReply 非流式分支与 openaiRenderer.nonStream 复用）
+func writeOpenAICompletion(w io.Writer, model, text string) {
+	created := time.Now().Unix()
+	id := fmt.Sprintf("chatcmpl-%d", created)
+	resp := map[string]any{
+		"id": id, "object": "chat.completion", "created": created, "model": model,
+		"choices": []map[string]any{{
+			"index":         0,
+			"message":       map[string]any{"role": "assistant", "content": text},
+			"finish_reason": "stop",
+		}},
+		"usage": map[string]any{"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+	}
+	json.NewEncoder(w).Encode(resp)
+}
+
 // writeRemoteReply 把 remote 通道的回复文本写成 OpenAI 格式响应体。
 // 流式的响应头已由 startRemoteStream 提前发出（keepalive 需要），此处只写数据帧。
 func (h *Handler) writeRemoteReply(w http.ResponseWriter, stream bool, model, text string) {
@@ -747,17 +823,7 @@ func (h *Handler) writeRemoteReply(w http.ResponseWriter, stream bool, model, te
 	}
 	// 非流式
 	w.Header().Set("Content-Type", "application/json")
-	id := fmt.Sprintf("chatcmpl-%d", created)
-	resp := map[string]any{
-		"id": id, "object": "chat.completion", "created": created, "model": model,
-		"choices": []map[string]any{{
-			"index":         0,
-			"message":       map[string]any{"role": "assistant", "content": text},
-			"finish_reason": "stop",
-		}},
-		"usage": map[string]any{"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-	}
-	json.NewEncoder(w).Encode(resp)
+	writeOpenAICompletion(w, model, text)
 }
 
 // ---------------------------------------------------------------------------
@@ -796,11 +862,19 @@ func startRemoteStream(w http.ResponseWriter) {
 //
 // 返回 nil 表示响应已完整写出（成功，或流式内嵌错误帧）；返回错误表示未写任何响应
 // 字节，由调用方决定轮转下一账号或返回错误。
+// serveRemote 是 OpenAI 通道的完整往返入口（渲染固定用 OpenAI 帧）。
 func (h *Handler) serveRemote(w http.ResponseWriter, r *http.Request, a *auth.Auth, model string, body []byte, stream bool, maxMode bool) error {
+	return h.serveRemoteWith(w, r, a, model, body, stream, maxMode, openaiRenderer{})
+}
+
+// serveRemoteWith 执行 remote 通道完整往返（P1 起支持会话复用）：与
+// serveRemote 逻辑完全一致，仅把「增量/终态→协议帧」的渲染交给 render
+//（OpenAI 或 Anthropic）。复用会话注册表/账号池/串行化。
+func (h *Handler) serveRemoteWith(w http.ResponseWriter, r *http.Request, a *auth.Auth, model string, body []byte, stream bool, maxMode bool, render remoteRenderer) error {
 	// P1 兼容：未启用会话注册表（DisableConvReuse 或字面量构造的 Handler）
 	// 时保持旧行为——每次新建、用完即删。
 	if h.convs == nil {
-		return h.serveRemoteLegacy(w, r, a, model, body, stream, maxMode)
+		return h.serveRemoteLegacyWith(w, r, a, model, body, stream, maxMode, render)
 	}
 
 	msgs := bodyMessages(body)
@@ -899,15 +973,20 @@ func (h *Handler) serveRemote(w http.ResponseWriter, r *http.Request, a *auth.Au
 
 	// 响应泵：流式事件订阅 + keepalive + 轮询终态裁决（二期逻辑原样）。
 	// 成功路径顺带把回复尾迹写回会话注册表（bindConv 的 replyTail 参数）。
-	return h.serveRemotePump(w, r, a, sessID, model, stream, func(reply string) {
+	return h.serveRemotePumpWith(w, r, a, sessID, model, stream, func(reply string) {
 		h.bindConv(sessID, a.UID, terminalKey, len(msgs), replyTail(reply))
-	})
+	}, render)
 }
 
-// serveRemotePump 二期的响应泵主体：流式首帧/MCP 事件订阅/云端事件流/
-// keepalive/轮询终态裁决。onReply 非 nil 时在成功拿到最终回复后回调一次
-//（P1 会话注册表刷新用）。
+// serveRemotePump 是 serveRemote 的 OpenAI 渲染入口（保持旧签名兼容测试）。
 func (h *Handler) serveRemotePump(w http.ResponseWriter, r *http.Request, a *auth.Auth, sessID, model string, stream bool, onReply func(string)) error {
+	return h.serveRemotePumpWith(w, r, a, sessID, model, stream, onReply, openaiRenderer{})
+}
+
+// serveRemotePumpWith 二期的响应泵主体：流式首帧/MCP 事件订阅/云端事件流/
+// keepalive/轮询终态裁决。onReply 非 nil 时在成功拿到最终回复后回调一次
+//（P1 会话注册表刷新用）。增量与终态的协议帧由 render 渲染。
+func (h *Handler) serveRemotePumpWith(w http.ResponseWriter, r *http.Request, a *auth.Auth, sessID, model string, stream bool, onReply func(string), render remoteRenderer) error {
 
 	// 流式：先发头并周期发 SSE 注释心跳，防止客户端在分钟级轮询期间因空闲断连。
 	var mu sync.Mutex
@@ -916,11 +995,12 @@ func (h *Handler) serveRemotePump(w http.ResponseWriter, r *http.Request, a *aut
 	stopEventPump := func() {} // 非 stream 时空操作；stream 时替换为真正的收泵逻辑
 	if stream {
 		startRemoteStream(w)
-		// 首帧：role assistant（任意 OpenAI 客户端都以它开始累积 assistant 消息）。
+		// 首帧：交给 render（OpenAI=role assistant chunk；Anthropic=message_start
+		// + 内容块管理），客户端以它开始累积 assistant 消息。
 		taskID = fmt.Sprintf("chatcmpl-%d", time.Now().Unix())
 		taskCreated = time.Now().Unix()
 		mu.Lock()
-		writeChatChunk(w, taskID, taskCreated, model, "assistant", "", nil)
+		render.streamStart(w, taskID, model, taskCreated)
 		sseFlush(w)
 		mu.Unlock()
 
@@ -978,7 +1058,7 @@ func (h *Handler) serveRemotePump(w http.ResponseWriter, r *http.Request, a *aut
 						continue
 					}
 					mu.Lock()
-					writeChatChunk(w, taskID, taskCreated, model, "", text, nil)
+					render.text(w, taskID, model, taskCreated, text)
 					sseFlush(w)
 					mu.Unlock()
 				case d, ok := <-evCh:
@@ -993,7 +1073,7 @@ func (h *Handler) serveRemotePump(w http.ResponseWriter, r *http.Request, a *aut
 						continue
 					}
 					mu.Lock()
-					writeRemoteDelta(w, taskID, taskCreated, model, d)
+					render.delta(w, taskID, model, taskCreated, d)
 					sseFlush(w)
 					mu.Unlock()
 				case <-drainReq:
@@ -1013,7 +1093,7 @@ func (h *Handler) serveRemotePump(w http.ResponseWriter, r *http.Request, a *aut
 								continue
 							}
 							mu.Lock()
-							writeChatChunk(w, taskID, taskCreated, model, "", text, nil)
+							render.text(w, taskID, model, taskCreated, text)
 							sseFlush(w)
 							mu.Unlock()
 						case d, ok := <-evCh:
@@ -1025,7 +1105,7 @@ func (h *Handler) serveRemotePump(w http.ResponseWriter, r *http.Request, a *aut
 								continue
 							}
 							mu.Lock()
-							writeRemoteDelta(w, taskID, taskCreated, model, d)
+							render.delta(w, taskID, model, taskCreated, d)
 							sseFlush(w)
 							mu.Unlock()
 						}
@@ -1090,15 +1170,11 @@ func (h *Handler) serveRemotePump(w http.ResponseWriter, r *http.Request, a *aut
 		}
 		stopEventPump() // 先停事件泵，迟到工具事件不得出现在错误帧之后
 		mu.Lock()
-		status, _ := upstreamErrorStatus(werr)
-		errPayload, _ := json.Marshal(map[string]any{
-			"error": map[string]any{"message": werr.Error(), "type": "api_error", "code": "remote_task_failed"},
-		})
+		status, code := upstreamErrorStatus(werr)
 		if status == http.StatusServiceUnavailable {
 			w.Header().Set("Retry-After", "10")
 		}
-		fmt.Fprintf(w, "data: %s\n\n", errPayload)
-		w.Write([]byte("data: [DONE]\n\n"))
+		render.streamErr(w, status, code, werr.Error())
 		sseFlush(w)
 		mu.Unlock()
 		return nil
@@ -1109,22 +1185,17 @@ func (h *Handler) serveRemotePump(w http.ResponseWriter, r *http.Request, a *aut
 	}
 	if stream {
 		// 终态裁决：先停事件泵（确保没有迟到工具事件穿插在终帧之后），
-		// 再推分隔线 → 最终全文（单个 delta）→ finish_reason:stop → [DONE]。
-		// 分隔线走 delta.content 而非裸 SSE 行：裸行会被客户端 SSE 解析器
-		// 当注释丢弃，走 delta 才能在客户端累积文本里呈现为 markdown 分隔线。
-		// 非流式路径的行为保持一字不差。
+		// 再由 render 推收尾帧（OpenAI=分隔线+终稿+[DONE]；
+		// Anthropic=收内容块+message_delta+message_stop）。
 		stopEventPump()
 		mu.Lock()
-		writeChatChunk(w, taskID, taskCreated, model, "", "\n\n---\n\n", nil)
-		writeChatChunk(w, taskID, taskCreated, model, "", replyText, nil)
-		writeChatChunk(w, taskID, taskCreated, model, "", "", "stop")
-		fmt.Fprint(w, "data: [DONE]\n\n")
+		render.streamFinish(w, taskID, model, taskCreated, replyText)
 		sseFlush(w)
 		mu.Unlock()
 		return nil
 	}
 	mu.Lock()
-	h.writeRemoteReply(w, stream, model, replyText)
+	render.nonStream(w, model, replyText)
 	mu.Unlock()
 	return nil
 }

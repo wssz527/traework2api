@@ -59,7 +59,14 @@ func (h *Handler) sendRemoteWithBusyRetry(r *http.Request, a *auth.Auth, sessID,
 
 // serveRemoteLegacy P1 之前的完整往返。会话复用禁用（convs==nil）时由
 // serveRemote 调用，行为与二期完全一致。
+// serveRemoteLegacy 是 OpenAI 通道的 legacy 渲染入口。
 func (h *Handler) serveRemoteLegacy(w http.ResponseWriter, r *http.Request, a *auth.Auth, model string, body []byte, stream bool, maxMode bool) error {
+	return h.serveRemoteLegacyWith(w, r, a, model, body, stream, maxMode, openaiRenderer{})
+}
+
+// serveRemoteLegacyWith P1 之前的完整往返。会话复用禁用（convs==nil）时由
+// serveRemoteWith 调用，行为与二期完全一致，仅协议帧渲染交给 render。
+func (h *Handler) serveRemoteLegacyWith(w http.ResponseWriter, r *http.Request, a *auth.Auth, model string, body []byte, stream bool, maxMode bool, render remoteRenderer) error {
 	sessID, err := h.cfg.Upstream.RemoteCreateSession(a)
 	if err != nil {
 		return err
@@ -77,7 +84,7 @@ func (h *Handler) serveRemoteLegacy(w http.ResponseWriter, r *http.Request, a *a
 	if err := h.sendRemoteWithBusyRetry(r, a, sessID, model, userText, maxMode); err != nil {
 		return err
 	}
-	return h.serveRemotePump(w, r, a, sessID, model, stream, nil)
+	return h.serveRemotePumpWith(w, r, a, sessID, model, stream, nil, render)
 }
 
 // ---------------------------------------------------------------------------
