@@ -36,19 +36,32 @@ func (h *Handler) bindConv(sessID, uid, terminalKey string, consumed int, replyT
 
 // sendRemoteWithBusyRetry 发消息；429 并发槽满（ErrRemoteBusy）短暂等待后重试，
 // 至多 3 次（与二期行为一致），其他错误立即返回。
+// remoteBusyRetryWaits 递增退避：15s → 30s → 60s（对齐 codex-proxy 的
+// proxy-fallback-retry 递增重试计划）。超过则返回 ErrRemoteBusyAfterRetries
+// 让外层轮转换号。
+var remoteBusyRetryWaits = []time.Duration{15 * time.Second, 30 * time.Second, 60 * time.Second}
+
 func (h *Handler) sendRemoteWithBusyRetry(r *http.Request, a *auth.Auth, sessID, model, userText string, maxMode bool) error {
+	var lastErr error
+	// 首次发送不算重试；失败后最多 len(remoteBusyRetryWaits) 次等待重试。
 	for attempt := 0; ; attempt++ {
+		// 重试耗尽（已等过 len 次）→ 特殊错误让外层换账号
+		if attempt >= len(remoteBusyRetryWaits) {
+			return fmt.Errorf("%w: %s", upstream.ErrRemoteBusyAfterRetries, lastErr.Error())
+		}
 		_, err := h.cfg.Upstream.RemoteSendMessage(a, sessID, model, userText, maxMode)
 		if err == nil {
 			return nil
 		}
-		if !errors.Is(err, upstream.ErrRemoteBusy) || attempt >= 2 {
+		if !errors.Is(err, upstream.ErrRemoteBusy) {
 			return err
 		}
+		lastErr = err
+		wait := remoteBusyRetryWaits[attempt]
 		select {
 		case <-r.Context().Done():
 			return r.Context().Err()
-		case <-time.After(remoteBusyRetryWait):
+		case <-time.After(wait):
 		}
 	}
 }

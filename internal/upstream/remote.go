@@ -36,6 +36,9 @@ var ErrRemoteBusy = errors.New("remote solo agent parallel limit reached")
 // ErrRemoteTimeout 远程任务在总时限内未完成（上游重任务实测排队+执行可达 13 分钟）。
 var ErrRemoteTimeout = errors.New("remote task timeout")
 
+// ErrRemoteBusyAfterRetries 重试耗尽仍并发槽满（429）：调用方应换账号或放弃。
+var ErrRemoteBusyAfterRetries = errors.New("remote busy after retries")
+
 // remoteHostMu 保护 remoteHost 的并发读写：事件流 goroutine 会在任务
 // 结束后仍存活片刻（drain / 重连退避），此时单测替换 host 变量会构成
 // 数据竞争（-race 下已实际命中）。
@@ -228,6 +231,10 @@ func (c *Client) RemoteSendMessage(a *auth.Auth, sessionID, model, userText stri
 	if resp.StatusCode >= 400 {
 		// 429 并发槽满：可等待重试的临时状态，与真实错误区分开。
 		if resp.StatusCode == http.StatusTooManyRequests && strings.Contains(string(data), "solo_agent_parallel_limit") {
+			// 提取 Retry-After 头（秒），供重试策略做递增退避。
+			if ra := resp.Header.Get("Retry-After"); ra != "" {
+				return "", fmt.Errorf("%w: %s (retry-after=%s)", ErrRemoteBusy, truncate(string(data), 200), ra)
+			}
 			return "", fmt.Errorf("%w: %s", ErrRemoteBusy, truncate(string(data), 200))
 		}
 		return "", fmt.Errorf("send message: %d %s", resp.StatusCode, truncate(string(data), 200))

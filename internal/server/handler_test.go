@@ -527,12 +527,15 @@ func TestChatGLM53RoutesThroughRemoteSession(t *testing.T) {
 
 func remoteTestHook() (restore func()) {
 	oldWait, oldKeep, oldBusy := remoteWaitTotal, remoteKeepaliveInterval, remoteBusyRetryWait
+	oldBusyWaits := remoteBusyRetryWaits
 	remoteWaitTotal, remoteKeepaliveInterval, remoteBusyRetryWait = 200*time.Millisecond, 20*time.Millisecond, 10*time.Millisecond
+	remoteBusyRetryWaits = []time.Duration{10 * time.Millisecond, 10 * time.Millisecond, 10 * time.Millisecond}
 	// P0 事件流拨号走 remoteHost；单测里指向本地死端口使其立即失败、
 	// 静默降级——不出网、不拖慢用例、也不受外部网络环境干扰。
 	restoreHost := upstream.SetRemoteHost("http://127.0.0.1:1")
 	return func() {
 		remoteWaitTotal, remoteKeepaliveInterval, remoteBusyRetryWait = oldWait, oldKeep, oldBusy
+		remoteBusyRetryWaits = oldBusyWaits
 		restoreHost()
 	}
 }

@@ -434,7 +434,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if errors.Is(rerr, context.Canceled) {
 				return // 客户端已断开
 			}
-			if errors.Is(rerr, upstream.ErrRemoteBusy) {
+			if errors.Is(rerr, upstream.ErrRemoteBusy) || errors.Is(rerr, upstream.ErrRemoteBusyAfterRetries) {
+				// 并发槽满（含重试耗尽）：冷却 + 换下一账号
 				h.cfg.Pool.Cooldown(acct.UID, pool.CoolSoft, h.cfg.SoftCooldown, "remote parallel limit")
 			} else {
 				h.cfg.Pool.NoteError(acct.UID, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
@@ -617,7 +618,7 @@ func writeOpenAIError(w http.ResponseWriter, status int, code, msg string) {
 // upstreamErrorStatus 返回上游错误对应的 HTTP 状态码（流式错误帧用）。
 func upstreamErrorStatus(err error) (int, string) {
 	// sentinel 错误（remote 通道专用）
-	if errors.Is(err, upstream.ErrRemoteBusy) {
+	if errors.Is(err, upstream.ErrRemoteBusy) || errors.Is(err, upstream.ErrRemoteBusyAfterRetries) {
 		return http.StatusServiceUnavailable, "upstream_rate_limited"
 	}
 	if errors.Is(err, upstream.ErrRemoteTimeout) {
@@ -646,7 +647,7 @@ func upstreamErrorStatus(err error) (int, string) {
 }
 
 func writeUpstreamError(w http.ResponseWriter, err error) {
-	if errors.Is(err, upstream.ErrRemoteBusy) {
+	if errors.Is(err, upstream.ErrRemoteBusy) || errors.Is(err, upstream.ErrRemoteBusyAfterRetries) {
 		w.Header().Set("Retry-After", "10")
 		writeOpenAIError(w, http.StatusServiceUnavailable, "upstream_rate_limited", err.Error())
 		return
