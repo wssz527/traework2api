@@ -34,9 +34,17 @@ func TestWriteRemoteDeltaContent(t *testing.T) {
 
 func TestWriteRemoteDeltaToolLine(t *testing.T) {
 	var sb strings.Builder
-	writeRemoteDelta(&sb, "id", 1, "m", upstream.RemoteEventDelta{ToolLine: "\n\n> 🔧 [本地工具] read_file\n"})
-	if got := sb.String(); !strings.Contains(got, "🔧") {
-		t.Fatalf("工具注记应写入 delta.content: %q", got)
+	writeRemoteDelta(&sb, "id", 1, "m", upstream.RemoteEventDelta{ToolLine: "\n\n> 🔧 [本地工具] 本地工作区/read_file · {\"path\":\"/tmp/x\"}\n"})
+	got := sb.String()
+	// 工具调用应走结构化 delta.tool_calls（客户端正确显示为工具调用而非文本）
+	if !strings.Contains(got, "tool_calls") {
+		t.Fatalf("工具注记应写入 delta.tool_calls: %q", got)
+	}
+	if !strings.Contains(got, "read_file") {
+		t.Fatalf("tool_calls 应含工具名 read_file: %q", got)
+	}
+	if strings.Contains(got, "🔧") {
+		t.Errorf("注记 emoji 不应出现在结构化字段里: %q", got)
 	}
 }
 

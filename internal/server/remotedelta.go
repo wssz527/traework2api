@@ -22,8 +22,70 @@ func writeRemoteDelta(w io.Writer, id string, created int64, model string, d ups
 	case d.Content != "":
 		writeChatChunk(w, id, created, model, "", d.Content, nil)
 	case d.ToolLine != "":
-		writeChatChunk(w, id, created, model, "", d.ToolLine, nil)
+		// 工具调用走 OpenAI 流式结构化字段 delta.tool_calls，
+		// 客户端正确显示为「工具调用」而非普通文本。
+		writeChunkWithToolCall(w, id, created, model, d.ToolLine)
 	}
+}
+
+// writeChunkWithToolCall 输出带 tool_calls 的 chunk（工具调用结构化字段）。
+// 解析注记行里的工具名与参数摘要，尽量填充 function.name / arguments。
+func writeChunkWithToolCall(w io.Writer, id string, created int64, model, line string) {
+	name, args := parseToolLine(line)
+	delta := map[string]any{
+		"tool_calls": []map[string]any{{
+			"index": 0,
+			"type":  "function",
+			"function": map[string]any{
+				"name":      name,
+				"arguments": args,
+			},
+		}},
+	}
+	chunk := map[string]any{
+		"id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+		"choices": []map[string]any{{
+			"index": 0, "delta": delta, "finish_reason": nil,
+		}},
+	}
+	raw, _ := json.Marshal(chunk)
+	fmt.Fprintf(w, "data: %s\n\n", raw)
+}
+
+// parseToolLine 从注记行提取工具名与参数 JSON。
+// 行格式（remote_events.go 的 formatToolLine）："> 🔧 [本地工具] 标签/工具名 · 参数"
+// 或 "> 🔧 [沙盒] 工具名"。
+func parseToolLine(line string) (name, args string) {
+	s := strings.TrimSpace(line)
+	s = strings.TrimPrefix(s, ">")
+	s = strings.TrimSpace(s)
+	// 去 emoji 前缀
+	for _, em := range []string{"🔧", "✅", "❌"} {
+		s = strings.TrimPrefix(s, em)
+	}
+	s = strings.TrimSpace(s)
+	// 去 [分类] 前缀
+	if i := strings.Index(s, "]"); i >= 0 && strings.HasPrefix(s, "[") {
+		s = s[i+1:]
+	}
+	s = strings.TrimSpace(s)
+	// 分离 工具名 · 参数
+	if i := strings.Index(s, "·"); i >= 0 {
+		name = strings.TrimSpace(s[:i])
+		args = strings.TrimSpace(s[i+1:])
+	} else {
+		name = strings.TrimSpace(s)
+	}
+	// 工具名取 / 后末段
+	if i := strings.LastIndex(name, "/"); i >= 0 {
+		name = name[i+1:]
+	}
+	name = strings.TrimSpace(name)
+	// 参数若是 JSON 保持，否则当字符串参数
+	if args != "" && !strings.HasPrefix(args, "{") {
+		args = fmt.Sprintf(`{"input":%q}`, args)
+	}
+	return name, args
 }
 
 // writeChunkWithReasoning 输出带 reasoning_content 的 chunk（DeepSeek 风格字段）。
