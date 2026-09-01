@@ -997,7 +997,17 @@ func (h *Handler) serveRemotePump(w http.ResponseWriter, r *http.Request, a *aut
 	replyText, werr := h.cfg.Upstream.RemoteWaitAndRead(r.Context(), a, sessID, remoteWaitTotal)
 	if werr != nil {
 		if errors.Is(werr, context.Canceled) {
-			return werr // 客户端已断开，写响应无意义
+			// 客户端已断开（点终止/关会话）：删云端会话停掉任务，释放
+			// 并发槽、停止烧积分，避免任务在云端空跑。
+			// 仅主路径（注册表启用）在此删除；legacy 路径由 serveRemoteLegacy
+			// 的 defer 统一删除，避免双重删除。
+			if h.convs != nil {
+				log.Printf("remote: client cancelled sess=%s -> delete cloud session", sessID)
+				if dErr := h.cfg.Upstream.RemoteDeleteSession(a, sessID); dErr != nil {
+					log.Printf("remote: delete session %s after cancel: %v", sessID, dErr)
+				}
+			}
+			return werr // 写响应无意义
 		}
 		if !stream {
 			return werr
