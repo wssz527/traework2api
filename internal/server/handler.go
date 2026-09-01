@@ -774,15 +774,7 @@ func (h *Handler) serveRemote(w http.ResponseWriter, r *http.Request, a *auth.Au
 	if reuseID != "" {
 		sessID = reuseID
 		log.Printf("remote: reuse session=%s model=%s uid=%s append=%dB", sessID, model, a.UID, len(appendText))
-		if appendText == "" {
-			// 增量剥离后为空 = 本轮请求没有真正的新内容要发（新会话首条命中
-			// 旧注册项 / 中断后续问但历史已全部消费 / 客户端重发同一历史）。
-			// 空复用只会空等旧会话已结束的回复，且让云端停留在旧上下文，
-			// 客户端新消息进不去 → 上下文错乱（实测 session_066c213e）。
-			// 一律降级新建，保证每轮客户端消息都真实进入云端会话。
-			log.Printf("remote: reuse rejected (empty append) session=%s -> rebuild", sessID)
-			sessID = ""
-		} else if appendText != "" {
+		if appendText != "" {
 			serr := h.sendRemoteWithBusyRetry(r, a, sessID, model, appendText, maxMode)
 			if serr != nil {
 				if errors.Is(serr, context.Canceled) {
@@ -792,6 +784,13 @@ func (h *Handler) serveRemote(w http.ResponseWriter, r *http.Request, a *auth.Au
 				h.convs.Unbind(sessID)
 				sessID = ""
 			}
+		} else {
+			// 增量剥离后为空：Lookup 已命中同一会话（reuseID 非空），说明这是
+			// 同一客户端会话的连续轮次但没有新内容（agent 循环的工具回填轮 /
+			// 历史已全部消费的重发）。此时复用会话但不发送——云端任务可能
+			// 还在跑（等它的结果），或直接走轮询等终态。不能新建（会无限
+			// 循环建会话，实测 16:41-16:44 连续 3 次 create）。
+			log.Printf("remote: reuse (empty append, no send) session=%s", sessID)
 		}
 	}
 	if sessID == "" {

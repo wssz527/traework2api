@@ -617,8 +617,8 @@ func TestConvStoreNewSessionSameFirstPromptNoReuse(t *testing.T) {
 	}
 }
 
-// 回归：新会话首条（同提示词、无 assistant 回显）不得复用旧云端会话，
-// 必须新建（此前 append=0B 空复用导致误连旧会话空等）。
+// 回归：完全相同的提示词重发 = 同一会话重发（无新内容）→ 复用旧云端会话
+// 但不发送（等云端结果），不得新建（否则 agent 循环会无限建会话）。
 func TestServeRemoteNewSessionSamePromptNoReuse(t *testing.T) {
 	restore := remoteTestHook()
 	defer restore()
@@ -645,15 +645,18 @@ func TestServeRemoteNewSessionSamePromptNoReuse(t *testing.T) {
 		t.Fatalf("turn1 creates=%d want 1", creates)
 	}
 
-	// turn2：完全相同的提示词、无 assistant 历史 → 必须新建（不复用 cs1）
+	// turn2：完全相同的提示词、无新内容 → 复用 cs1 但不发送（不新建）
 	rec2 := httptest.NewRecorder()
 	h.ServeHTTP(rec2, httptest.NewRequest("POST", "/v1/chat/completions",
 		strings.NewReader(string(bodyWith(turn1)))))
 	if rec2.Code != 200 {
 		t.Fatalf("turn2 code=%d body=%s", rec2.Code, rec2.Body)
 	}
-	if creates != 2 {
-		t.Errorf("新会话首条应新建会话：creates=%d want 2（误复用则仍是 1）", creates)
+	if creates != 1 {
+		t.Errorf("同提示词重发应复用会话（不新建）：creates=%d want 1", creates)
+	}
+	if sends["cs1"] != 1 {
+		t.Errorf("重发无新内容不应再发送：sends[cs1]=%d want 1（仅 turn1 发过）", sends["cs1"])
 	}
 }
 
@@ -763,12 +766,12 @@ func TestMatrixNewSessionThenReuse(t *testing.T) {
 	}, []int{1, 1})
 }
 
-// 场景 2：新会话 → 完全相同提示词重发（无 assistant）→ 必须新建（不误连）
+// 场景 2：新会话 → 完全相同提示词重发（无新内容）→ 复用会话不新建
 func TestMatrixSamePromptNewSession(t *testing.T) {
 	runSessionMatrix(t, "same-prompt-new-session", [][]map[string]any{
 		msgsOf("user", "查磁盘"),
 		msgsOf("user", "查磁盘"),
-	}, []int{1, 2})
+	}, []int{1, 1})
 }
 
 // 场景 3：system 每轮变 → 同会话续问仍复用
@@ -788,4 +791,44 @@ func TestMatrixThreeTurnsOneSession(t *testing.T) {
 		msgsOf("user", "问题1", "assistant", "云端回复A", "user", "问题2"),
 		msgsOf("user", "问题1", "assistant", "云端回复A", "user", "问题2", "assistant", "云端回复A", "user", "问题3"),
 	}, []int{1, 1, 1})
+}
+
+// 回归：agent 循环的多轮请求（每轮带完整历史，部分轮无新 user 内容）
+// 不得无限新建会话——空增量轮复用会话不发送。
+func TestAgentLoopNoInfiniteCreate(t *testing.T) {
+	restore := remoteTestHook()
+	defer restore()
+	var mu sync.Mutex
+	var creates int
+	sends := map[string]int{}
+	lastText := map[string]string{}
+	up := convReuseFakeUpstream(t, &mu, &creates, sends, lastText, false)
+	h := NewHandler(Config{
+		Pool:          testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream:      up,
+		ConvStorePath: isolatedConvStore(),
+	})
+	// 轮1：user 查磁盘 → create
+	turn1 := msgsOf("user", "查磁盘")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(string(bodyWith(turn1)))))
+	if creates != 1 {
+		t.Fatalf("turn1 creates=%d want 1", creates)
+	}
+	// 轮2：同历史 + assistant 回显 + 新 user → reuse+send
+	turn2 := msgsOf("user", "查磁盘", "assistant", "云端回复A", "user", "再查内存")
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(string(bodyWith(turn2)))))
+	if creates != 1 {
+		t.Fatalf("turn2 creates=%d want 1（应复用）", creates)
+	}
+	// 轮3：同完整历史重发（无新内容）→ 复用不发送、不新建
+	rec3 := httptest.NewRecorder()
+	h.ServeHTTP(rec3, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(string(bodyWith(turn2)))))
+	if creates != 1 {
+		t.Fatalf("turn3 creates=%d want 1（空增量轮不得新建）", creates)
+	}
+	if sends["cs1"] != 2 {
+		t.Errorf("turn3 不应发送：sends[cs1]=%d want 2", sends["cs1"])
+	}
 }
