@@ -75,6 +75,12 @@ func convPrefixChain(model string, maxMode bool, messages []map[string]any) []st
 	h := sha256.Sum256([]byte("tw2api-conv-v1|" + model + "|max=" + boolStr(maxMode)))
 	chain := make([]string, 0, len(messages))
 	for _, msg := range messages {
+		// system 消息是会话无关的元数据（工具列表/token 计数/时间戳每轮都变），
+		// 参与链哈希会导致同一会话的连续轮次链首项不同、Lookup 永远 miss、
+		// 每轮新建云端会话。跳过 system，只对 user/assistant 对话建链。
+		if role, _ := msg["role"].(string); role == "system" {
+			continue
+		}
 		raw, _ := json.Marshal(msg)
 		sum := sha256.Sum256(append(h[:], raw...))
 		chain = append(chain, hex.EncodeToString(sum[:]))
