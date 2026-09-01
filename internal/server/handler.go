@@ -616,7 +616,7 @@ func remotePrompt(body []byte) string {
 		msg, _ := raw.(map[string]any)
 		role, _ := msg["role"].(string)
 		text := messageText(msg["content"])
-		if text != "" {
+		if text != "" && !strings.Contains(text, "<system-reminder>") {
 			parts = append(parts, role+":\n"+text)
 		}
 	}

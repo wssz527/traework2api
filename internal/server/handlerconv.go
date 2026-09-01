@@ -99,12 +99,18 @@ func bodyMessages(body []byte) []map[string]any {
 // formatIncrement 把增量 messages 渲染成发进云端会话的单段文本。
 // 格式与 remotePrompt 一致（role:\n内容），保证云端看到的对话形态统一；
 // 跳过无文本内容的消息（如纯 tool_calls 载荷）。
+// 过滤 <system-reminder> 包裹的注入内容（CLI 内部机制，非用户对话，
+// 发进云端会污染上下文——实测 CLI -r resume 会把 system-reminder
+// 当 user 消息带进来）。
 func formatIncrement(msgs []map[string]any) string {
 	parts := make([]string, 0, len(msgs))
 	for _, m := range msgs {
 		role, _ := m["role"].(string)
 		text := messageText(m["content"])
 		if text == "" {
+			continue
+		}
+		if strings.Contains(text, "<system-reminder>") {
 			continue
 		}
 		parts = append(parts, role+":\n"+text)

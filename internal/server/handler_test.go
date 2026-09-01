@@ -203,7 +203,8 @@ func TestRemotePromptPreservesStructuredOpenAIMessages(t *testing.T) {
 		{"role":"user","content":[{"type":"text","text":"只回复 OK"}]},
 		{"role":"user","content":[{"type":"text","text":"<system-reminder>日期</system-reminder>"}]}
 	]}`)
-	want := "system:\n规则\n\nuser:\n只回复 OK\n\nuser:\n<system-reminder>日期</system-reminder>"
+	// system-reminder 是 CLI 内部注入，不应发进云端会话（会污染上下文）。
+	want := "system:\n规则\n\nuser:\n只回复 OK"
 
 	if got := remotePrompt(body); got != want {
 		t.Errorf("prompt=%q want=%q", got, want)
