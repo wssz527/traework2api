@@ -68,3 +68,35 @@ func OAuthHeaders(req *http.Request) {
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", clientUA)
 }
+
+// RemoteHeaders 设置 remote 通道（chat_sessions/messages）请求头。
+// 与 python 成功路径完全一致（2026-08-27 实测 26 头）。
+func RemoteHeaders(req *http.Request, a *auth.Auth) {
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept-Encoding", "identity")
+	req.Header.Set("Authorization", "Cloud-IDE-JWT "+a.JWT())
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) TRAESOLOCN/1.107.1 Chrome/142.0.7444.235 Electron/39.2.7 Safari/537.36")
+	req.Header.Set("X-Preferenced-Language", "zh-cn")
+	req.Header.Set("X-Trae-Client-Type", "lite")
+	req.Header.Set("X-Trae-User-Timezone", "Asia/Shanghai")
+	req.Header.Set("X-User-Region", "CN")
+	req.Header.Set("X-Lgw-Req-Sdk-Type", "3")
+	req.Header.Set("Package-Type", "stable_cn")
+	req.Header.Set("App-Version", "0.1.56")
+	req.Header.Set("X-Request-Id", newUUID())
+	req.Header.Set("X-Ss-Dp", "787976")
+	req.Header.Set("X-Tt-Trace-Id", "00-"+randomHex(32)+"-0000000000000000-01")
+	req.Header.Set("X-Ide-Token", a.JWT())
+	req.Header.Set("X-Device-Id", a.DeviceID)
+	req.Header.Set("X-App-Id", AppID)
+	req.Header.Set("X-Ide-Version", "0.1.56")
+	req.Header.Set("X-Ide-Version-Code", "20260820")
+	req.Header.Set("X-Ide-Version-Type", "stable")
+	req.Header.Set("X-Machine-Id", a.MachineID)
+	req.Header.Set("X-Device-Type", "mac")
+	req.Header.Set("X-Device-Brand", "Mac16,10")
+	req.Header.Set("X-Device-Cpu", "Apple")
+	req.Header.Set("Request-Traffic-Type", "prod")
+	req.Header.Set("Origin", "vscode-file://vscode-app")
+}

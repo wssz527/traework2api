@@ -8,18 +8,19 @@ const (
 	ConsoleHost    = "https://www.trae.cn"
 	ClientID       = "en1oxy7wnw8j9n" // SOLO stable
 	AppID          = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8"
-	IdeVersion     = "0.1.43"
-	IdeVersionCode = "20260716"
+	IdeVersion     = "0.1.56"
+	IdeVersionCode = "20260820"
 	DeviceBrand    = "83DG"
 	OSVersion      = "Windows 11 Pro"
 	Function       = "solo_work_lite"
 
 	// 端点
-	EpChat          = "/api/agent/v3/llm_utils_chat"
-	EpModels        = "/api/ide/v1/get_detail_param"
-	EpExchange      = "/cloudide/api/v3/trae/oauth/ExchangeToken"
-	EpUserInfo      = "/cloudide/api/v3/trae/GetUserInfo"
-	EpCheckinStatus = "/trae/api/v2/ug/checkin_credits/status"
-	EpCheckinClaim  = "/trae/api/v2/ug/checkin_credits/claim"
-	EpEntUsage      = "/trae/api/v2/pay/ide_user_ent_usage"
+	EpChat            = "/api/agent/v3/llm_utils_chat"
+	EpCreateAgentTask = "/api/agent/v3/create_agent_task"
+	EpModels          = "/api/ide/v1/get_detail_param"
+	EpExchange        = "/cloudide/api/v3/trae/oauth/ExchangeToken"
+	EpUserInfo        = "/cloudide/api/v3/trae/GetUserInfo"
+	EpCheckinStatus   = "/trae/api/v2/ug/checkin_credits/status"
+	EpCheckinClaim    = "/trae/api/v2/ug/checkin_credits/claim"
+	EpEntUsage        = "/trae/api/v2/pay/ide_user_ent_usage"
 )
