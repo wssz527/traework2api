@@ -673,3 +673,119 @@ func TestTrimCloudEchoEmptyTailStripsEcho(t *testing.T) {
 		t.Fatalf("应剥离 assistant 只留 user，got %+v", out)
 	}
 }
+
+// 回归：system 消息内容变化（工具列表 hash/token 计数等每轮动态）不得
+// 影响前缀链——链只对 user/assistant 对话建。否则同会话连续轮次链首项
+// 不同 → Lookup 永远 miss → 每轮新建云端沙盒（实测根因 4e2caa0）。
+func TestConvPrefixChainSkipsSystem(t *testing.T) {
+	// 同会话两轮：system 内容不同（模拟动态注入），但对话部分相同
+	turn1 := append(msgsOf("system", "旧工具列表hash-aaa", "user", "查磁盘", "assistant", "用了60%"), msgsOf("user", "再查内存")...)
+	turn2 := append(msgsOf("system", "新工具列表hash-bbb", "user", "查磁盘", "assistant", "用了60%"), msgsOf("user", "再查内存")...)
+
+	c1 := convPrefixChain("glm-5.3", false, turn1)
+	c2 := convPrefixChain("glm-5.3", false, turn2)
+
+	if len(c1) != len(c2) {
+		t.Fatalf("链长应相同（system 不参与）：c1=%d c2=%d", len(c1), len(c2))
+	}
+	// 对话部分相同 → 链终值必须一致，Lookup 才能命中
+	if c1[len(c1)-1] != c2[len(c2)-1] {
+		t.Errorf("system 变化不应影响链终值：\n c1=%s\n c2=%s", c1[len(c1)-1], c2[len(c2)-1])
+	}
+	// system 不进链：链首项是第一个 user 消息的哈希（两轮首条 user 相同 → 首项相同，
+	// 恰好证明 system 没参与哈希）
+	if c1[0] != c2[0] {
+		t.Errorf("首项应为 user 哈希（system 不参与），c1=%s c2=%s", c1[0], c2[0])
+	}
+}
+
+// 回归：system 内容变化时，同会话第二轮（带完整历史）应命中注册表复用。
+func TestConvStoreReuseWithChangingSystem(t *testing.T) {
+	s := newConvStore("")
+	// 第一轮：system + user 查磁盘 → 建会话
+	turn1 := msgsOf("system", "旧hash", "user", "查磁盘")
+	chain1 := convPrefixChain("glm-5.3", false, turn1)
+	s.Bind("cloud-1", "u1", chain1[len(chain1)-1], len(chain1), "用了60%")
+
+	// 第二轮：system 内容变了 + 完整对话历史 + 新问题 → 应命中 cloud-1
+	turn2 := msgsOf("system", "新hash", "user", "查磁盘", "assistant", "用了60%", "user", "再查内存")
+	e, incFrom := s.Lookup("glm-5.3", false, turn2)
+	if e == nil || e.CloudSessionID != "cloud-1" {
+		t.Fatalf("system 变化后应命中原会话：e=%v", e)
+	}
+	// 第一轮链=[h(user)]，Bind 注册的键是 h(user)。第二轮命中 chain[0]（=h(user)），
+	// incFrom=1 → 增量从 assistant 回显开始，由 trimCloudEcho 剥离。
+	if incFrom != 1 {
+		t.Errorf("incFrom=%d want 1（命中 h(user)，增量从 assistant 起）", incFrom)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 会话生命周期系统性测试矩阵（按 systematic-debugging Phase 4 补全）
+// 覆盖：新会话 / 同会话续问 / 同提示词重发 / system 变化 / 尾迹空 /
+//       历史重写 / 账号粘性 / 会话死亡降级
+// ---------------------------------------------------------------------------
+
+// 矩阵核心：给定一轮轮次序列，断言每个轮次是 create 还是 reuse。
+// 每个场景独立 Handler（隔离注册表）。
+func runSessionMatrix(t *testing.T, name string, turns [][]map[string]any, wantCreates []int) {
+	t.Helper()
+	restore := remoteTestHook()
+	defer restore()
+	var mu sync.Mutex
+	var creates int
+	sends := map[string]int{}
+	lastText := map[string]string{}
+	up := convReuseFakeUpstream(t, &mu, &creates, sends, lastText, false)
+	h := NewHandler(Config{
+		Pool:          testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream:      up,
+		ConvStorePath: isolatedConvStore(),
+	})
+	for i, msgs := range turns {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+			strings.NewReader(string(bodyWith(msgs)))))
+		if rec.Code != 200 {
+			t.Fatalf("[%s turn%d] code=%d body=%s", name, i+1, rec.Code, rec.Body)
+		}
+		if creates != wantCreates[i] {
+			t.Errorf("[%s turn%d] creates=%d want=%d", name, i+1, creates, wantCreates[i])
+		}
+	}
+}
+
+// 场景 1：新会话 → 同会话续问（带 assistant 回显）→ 复用
+func TestMatrixNewSessionThenReuse(t *testing.T) {
+	runSessionMatrix(t, "new-then-reuse", [][]map[string]any{
+		msgsOf("user", "查磁盘"),
+		msgsOf("user", "查磁盘", "assistant", "云端回复A", "user", "再查内存"),
+	}, []int{1, 1})
+}
+
+// 场景 2：新会话 → 完全相同提示词重发（无 assistant）→ 必须新建（不误连）
+func TestMatrixSamePromptNewSession(t *testing.T) {
+	runSessionMatrix(t, "same-prompt-new-session", [][]map[string]any{
+		msgsOf("user", "查磁盘"),
+		msgsOf("user", "查磁盘"),
+	}, []int{1, 2})
+}
+
+// 场景 3：system 每轮变 → 同会话续问仍复用
+func TestMatrixChangingSystemReuse(t *testing.T) {
+	runSessionMatrix(t, "changing-system-reuse", [][]map[string]any{
+		msgsOf("system", "旧hash", "user", "查磁盘"),
+		msgsOf("system", "新hash", "user", "查磁盘", "assistant", "云端回复A", "user", "再查内存"),
+	}, []int{1, 1})
+}
+
+// 场景 4：三连轮次（连续两次续问）→ 全程一个会话
+func TestMatrixThreeTurnsOneSession(t *testing.T) {
+	// fake 的 assistant 回复固定为 "云端回复A"，尾迹校验要求请求里的
+	// assistant 回显与其互相包含。
+	runSessionMatrix(t, "three-turns-one-session", [][]map[string]any{
+		msgsOf("user", "问题1"),
+		msgsOf("user", "问题1", "assistant", "云端回复A", "user", "问题2"),
+		msgsOf("user", "问题1", "assistant", "云端回复A", "user", "问题2", "assistant", "云端回复A", "user", "问题3"),
+	}, []int{1, 1, 1})
+}
