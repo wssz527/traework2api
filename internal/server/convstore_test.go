@@ -832,3 +832,23 @@ func TestAgentLoopNoInfiniteCreate(t *testing.T) {
 		t.Errorf("turn3 不应发送：sends[cs1]=%d want 2", sends["cs1"])
 	}
 }
+
+// 回归：user 消息开头的 <system-reminder> 块不污染会话键
+// （移植 codex-proxy stable-conversation-key 机制）。
+func TestConvPrefixChainStripsSystemReminderInUser(t *testing.T) {
+	// 同一对话，一轮带 system-reminder 前缀、一轮不带
+	clean := msgsOf("user", "查磁盘", "assistant", "用了60%", "user", "再查内存")
+	dirty := msgsOf("user", "<system-reminder>\n日期 2026-09-01\n</system-reminder>\n查磁盘", "assistant", "用了60%", "user", "再查内存")
+
+	c1 := convPrefixChain("glm-5.3", false, clean)
+	c2 := convPrefixChain("glm-5.3", false, dirty)
+
+	if len(c1) != len(c2) {
+		t.Fatalf("链长应相同：c1=%d c2=%d", len(c1), len(c2))
+	}
+	for i := range c1 {
+		if c1[i] != c2[i] {
+			t.Errorf("第 %d 项哈希不同（system-reminder 应被剥离）：\n c1=%s\n c2=%s", i, c1[i], c2[i])
+		}
+	}
+}

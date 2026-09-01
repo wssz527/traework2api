@@ -535,11 +535,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, resp)
 		return
 	}
-	msg := "all accounts unavailable (cooling/disabled)"
 	if lastErr != nil {
-		msg += ": " + lastErr.Error()
+		writeUpstreamError(w, lastErr)
+		return
 	}
-	writeOpenAIError(w, http.StatusServiceUnavailable, "no_healthy_account", msg)
+	writeOpenAIError(w, http.StatusServiceUnavailable, "no_healthy_account", "all accounts unavailable (cooling/disabled)")
 }
 
 // handleStreamError 流式响应中的上游业务错误 → pool 冷却状态机。
@@ -599,6 +599,83 @@ func writeOpenAIError(w http.ResponseWriter, status int, code, msg string) {
 			"code":    code,
 		},
 	})
+}
+
+// writeUpstreamError 按上游错误类型映射 HTTP 状态码/错误类型/限流头
+// （对齐 codex-proxy error-classification + rate-limit-headers）：
+//   - ErrSoftRate（429）→ 503 + Retry-After 60s
+//   - ErrSessionDead（401）→ 502（账号失效，客户端可换号重试）
+//   - ErrPlanLimit（1005）→ 429 + Retry-After 12h
+//   - ErrRemoteBusy（并发槽满）→ 503 + Retry-After 10s
+//   - ErrRemoteTimeout → 504
+//   - ErrNotFound → 404
+//   - ErrServer（5xx）→ 502
+//   - ErrClient（其他 4xx）→ 400
+// upstreamErrorStatus 返回上游错误对应的 HTTP 状态码（流式错误帧用）。
+func upstreamErrorStatus(err error) (int, string) {
+	// sentinel 错误（remote 通道专用）
+	if errors.Is(err, upstream.ErrRemoteBusy) {
+		return http.StatusServiceUnavailable, "upstream_rate_limited"
+	}
+	if errors.Is(err, upstream.ErrRemoteTimeout) {
+		return http.StatusGatewayTimeout, "remote_task_timeout"
+	}
+	var ue *upstream.Error
+	if !errors.As(err, &ue) {
+		return http.StatusBadGateway, "upstream_error"
+	}
+	switch ue.Kind {
+	case upstream.ErrSoftRate:
+		return http.StatusServiceUnavailable, "upstream_rate_limited"
+	case upstream.ErrSessionDead:
+		return http.StatusServiceUnavailable, "upstream_session_dead"
+	case upstream.ErrPlanLimit:
+		return http.StatusTooManyRequests, "upstream_plan_limit"
+	case upstream.ErrNotFound:
+		return http.StatusNotFound, "upstream_not_found"
+	case upstream.ErrServer:
+		return http.StatusBadGateway, "upstream_server_error"
+	case upstream.ErrClient:
+		return http.StatusBadRequest, "upstream_client_error"
+	default:
+		return http.StatusBadGateway, "upstream_error"
+	}
+}
+
+func writeUpstreamError(w http.ResponseWriter, err error) {
+	if errors.Is(err, upstream.ErrRemoteBusy) {
+		w.Header().Set("Retry-After", "10")
+		writeOpenAIError(w, http.StatusServiceUnavailable, "upstream_rate_limited", err.Error())
+		return
+	}
+	if errors.Is(err, upstream.ErrRemoteTimeout) {
+		writeOpenAIError(w, http.StatusGatewayTimeout, "remote_task_timeout", err.Error())
+		return
+	}
+	var ue *upstream.Error
+	if !errors.As(err, &ue) {
+		writeOpenAIError(w, http.StatusBadGateway, "upstream_error", err.Error())
+		return
+	}
+	switch ue.Kind {
+	case upstream.ErrSoftRate:
+		w.Header().Set("Retry-After", "60")
+		writeOpenAIError(w, http.StatusServiceUnavailable, "upstream_rate_limited", err.Error())
+	case upstream.ErrSessionDead:
+		// 账号失效 = 无健康账号可用 → 503（与 no_healthy_account 同语义）
+		writeOpenAIError(w, http.StatusServiceUnavailable, "upstream_session_dead", err.Error())
+	case upstream.ErrPlanLimit:
+		w.Header().Set("Retry-After", "43200") // 12h
+		writeOpenAIError(w, http.StatusTooManyRequests, "upstream_plan_limit", err.Error())
+	case upstream.ErrNotFound:
+		writeOpenAIError(w, http.StatusNotFound, "upstream_not_found", err.Error())
+	case upstream.ErrServer:
+		writeOpenAIError(w, http.StatusBadGateway, "upstream_server_error", err.Error())
+	case upstream.ErrClient:
+		writeOpenAIError(w, http.StatusBadRequest, "upstream_client_error", err.Error())
+	default:
+		writeOpenAIError(w, http.StatusBadGateway, "upstream_error", err.Error())
+	}
 }
 
 // bodyUnmarshal 解析请求体为 map（失败返回空 map）
@@ -1013,9 +1090,13 @@ func (h *Handler) serveRemotePump(w http.ResponseWriter, r *http.Request, a *aut
 		}
 		stopEventPump() // 先停事件泵，迟到工具事件不得出现在错误帧之后
 		mu.Lock()
+		status, _ := upstreamErrorStatus(werr)
 		errPayload, _ := json.Marshal(map[string]any{
 			"error": map[string]any{"message": werr.Error(), "type": "api_error", "code": "remote_task_failed"},
 		})
+		if status == http.StatusServiceUnavailable {
+			w.Header().Set("Retry-After", "10")
+		}
 		fmt.Fprintf(w, "data: %s\n\n", errPayload)
 		w.Write([]byte("data: [DONE]\n\n"))
 		sseFlush(w)

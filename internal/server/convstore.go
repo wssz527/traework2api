@@ -29,6 +29,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sync"
 	"time"
 )
@@ -71,15 +72,33 @@ func newConvStore(fp string) *convStore {
 // 对应的链终值。hash_0 混入模型名（带 maxMode 标记）隔离不同模型/模式的
 // 会话；hash_{i} = H(hash_{i-1} + "|" + marshal(msg))。
 // 返回长度 len(messages) 的数组：prefix[i] = 前 i+1 条消息的链哈希。
+// systemReminderRe 匹配开头的 <system-reminder>...</system-reminder> 块
+// （kimi-code 每轮注入的日期/权限/插件通知，会污染会话键）。
+// 移植自 codex-proxy stable-conversation-key.ts 的 LEADING_SYSTEM_REMINDER_RE。
+var systemReminderRe = regexp.MustCompile(`^(?:<system-reminder>[\s\S]*?</system-reminder>\s*)+`)
+
+// normalizeConvAnchor 归一化会话锚点文本：剥掉开头的 system-reminder 块。
+func normalizeConvAnchor(text string) string {
+	return systemReminderRe.ReplaceAllString(text, "")
+}
+
 func convPrefixChain(model string, maxMode bool, messages []map[string]any) []string {
 	h := sha256.Sum256([]byte("tw2api-conv-v1|" + model + "|max=" + boolStr(maxMode)))
 	chain := make([]string, 0, len(messages))
 	for _, msg := range messages {
+		role, _ := msg["role"].(string)
 		// system 消息是会话无关的元数据（工具列表/token 计数/时间戳每轮都变），
 		// 参与链哈希会导致同一会话的连续轮次链首项不同、Lookup 永远 miss、
 		// 每轮新建云端会话。跳过 system，只对 user/assistant 对话建链。
-		if role, _ := msg["role"].(string); role == "system" {
+		if role == "system" {
 			continue
+		}
+		// user 消息先剥 system-reminder 再哈希（codex-proxy 稳定会话键机制）：
+		// system-reminder 出现在 user 消息里（中断恢复/插件通知）时不污染链。
+		if role == "user" {
+			if text, ok := msg["content"].(string); ok {
+				msg = map[string]any{"role": role, "content": normalizeConvAnchor(text)}
+			}
 		}
 		raw, _ := json.Marshal(msg)
 		sum := sha256.Sum256(append(h[:], raw...))
