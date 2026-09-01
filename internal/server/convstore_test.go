@@ -656,3 +656,20 @@ func TestServeRemoteNewSessionSamePromptNoReuse(t *testing.T) {
 		t.Errorf("新会话首条应新建会话：creates=%d want 2（误复用则仍是 1）", creates)
 	}
 }
+
+// 回归：注册表尾迹为空（上一轮未完成/回复为空）时，下一轮命中旧会话
+// 且增量含 assistant 回显，应剥离回显、允许复用（不得新建沙盒丢历史）。
+func TestTrimCloudEchoEmptyTailStripsEcho(t *testing.T) {
+	// 增量：user 新问题 + assistant 回显（尾迹空，无法校验）
+	inc := []map[string]any{
+		{"role": "assistant", "content": "云端上一轮的回复"},
+		{"role": "user", "content": "新问题"},
+	}
+	out, ok := trimCloudEcho(inc, "")
+	if !ok {
+		t.Fatal("空尾迹应允许复用（剥离 assistant 回显），got rejected")
+	}
+	if len(out) != 1 || out[0]["role"] != "user" {
+		t.Fatalf("应剥离 assistant 只留 user，got %+v", out)
+	}
+}

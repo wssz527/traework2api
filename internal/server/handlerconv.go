@@ -152,7 +152,11 @@ func trimCloudEcho(msgs []map[string]any, lastReplyTail string) ([]map[string]an
 		}
 		tail := strings.TrimSpace(lastReplyTail)
 		if tail == "" {
-			return nil, false
+			// 注册表无尾迹（上一轮任务未完成/回复为空）：无法校验回显。
+			// 但增量是从 consumed 之后开始的，其中的 assistant 消息在云端
+			// 必然已存在（它是上一轮生成的），安全剥离，不拒绝复用。
+			// 否则同一会话下一轮永远新建沙盒、丢失历史。
+			continue
 		}
 		if !strings.Contains(tail, text) && !strings.Contains(text, tail) {
 			return nil, false
