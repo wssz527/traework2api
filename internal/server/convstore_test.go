@@ -598,3 +598,61 @@ func TestConvReuseDisabledKeepsLegacy(t *testing.T) {
 }
 
 var _ = os.Getenv // 保持 os import
+
+// 回归：新会话第一条（纯 user 消息）不得复用旧会话（同提示词）。
+func TestConvStoreNewSessionSameFirstPromptNoReuse(t *testing.T) {
+	s := newConvStore("")
+	// 旧会话：第一轮 user "hi" → assistant "ok"
+	chain := convPrefixChain("glm-5.3", false, msgsOf("user", "hi", "assistant", "ok"))
+	s.Bind("cloud-old", "u1", chain[1], 2, "ok")
+
+	// 新会话第一条：只有 user "hi"，无历史 assistant 回显 → 必须新建，不命中旧会话
+	req := msgsOf("user", "hi")
+	e, incFrom := s.Lookup("glm-5.3", false, req)
+	if e != nil {
+		t.Fatalf("新会话第一条不得复用旧会话：got cloud=%s incFrom=%d", e.CloudSessionID, incFrom)
+	}
+	if incFrom != 0 {
+		t.Errorf("incFrom=%d want 0（全量重建）", incFrom)
+	}
+}
+
+// 回归：新会话首条（同提示词、无 assistant 回显）不得复用旧云端会话，
+// 必须新建（此前 append=0B 空复用导致误连旧会话空等）。
+func TestServeRemoteNewSessionSamePromptNoReuse(t *testing.T) {
+	restore := remoteTestHook()
+	defer restore()
+	var mu sync.Mutex
+	var creates int
+	sends := map[string]int{}
+	lastText := map[string]string{}
+	up := convReuseFakeUpstream(t, &mu, &creates, sends, lastText, false)
+	h := NewHandler(Config{
+		Pool:          testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream:      up,
+		ConvStorePath: isolatedConvStore(),
+	})
+
+	// turn1：新建会话 cs1
+	turn1 := msgsOf("user", "查一下磁盘")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(string(bodyWith(turn1)))))
+	if rec.Code != 200 {
+		t.Fatalf("turn1 code=%d body=%s", rec.Code, rec.Body)
+	}
+	if creates != 1 {
+		t.Fatalf("turn1 creates=%d want 1", creates)
+	}
+
+	// turn2：完全相同的提示词、无 assistant 历史 → 必须新建（不复用 cs1）
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(string(bodyWith(turn1)))))
+	if rec2.Code != 200 {
+		t.Fatalf("turn2 code=%d body=%s", rec2.Code, rec2.Body)
+	}
+	if creates != 2 {
+		t.Errorf("新会话首条应新建会话：creates=%d want 2（误复用则仍是 1）", creates)
+	}
+}

@@ -705,6 +705,13 @@ func (h *Handler) serveRemote(w http.ResponseWriter, r *http.Request, a *auth.Au
 	}
 
 	msgs := bodyMessages(body)
+	hasAssistant := false
+	for _, m := range msgs {
+		if role, _ := m["role"].(string); role == "assistant" {
+			hasAssistant = true
+			break
+		}
+	}
 	chain := convPrefixChain(model, maxMode, msgs)
 	var terminalKey string
 	if n := len(chain); n > 0 {
@@ -752,7 +759,13 @@ func (h *Handler) serveRemote(w http.ResponseWriter, r *http.Request, a *auth.Au
 	if reuseID != "" {
 		sessID = reuseID
 		log.Printf("remote: reuse session=%s model=%s uid=%s append=%dB", sessID, model, a.UID, len(appendText))
-		if appendText != "" {
+		if appendText == "" && !hasAssistant {
+			// 增量剥离后为空且请求无 assistant 回显 = 新会话首条命中旧注册项。
+			// 空复用只会空等旧会话已结束的回复，且让新会话误连旧云端会话。
+			// 视为无效复用，降级新建（关键修复：会话隔离）。
+			log.Printf("remote: reuse rejected (new session, empty append) session=%s -> rebuild", sessID)
+			sessID = ""
+		} else if appendText != "" {
 			serr := h.sendRemoteWithBusyRetry(r, a, sessID, model, appendText, maxMode)
 			if serr != nil {
 				if errors.Is(serr, context.Canceled) {
