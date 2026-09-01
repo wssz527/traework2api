@@ -91,6 +91,9 @@ type remoteEventStream struct {
 	// emittedTools 已输出过的工具调用注记（tool_call_info.id），
 	// 避免同一工具在多帧里重复刷屏（plan_item 会重复携带同一 tool_call）。
 	emittedTools map[string]bool
+	// emittedResults 已输出过结果回传的 tool_call.id（结果帧可能多帧，
+	// 只输出第一次）。
+	emittedResults map[string]bool
 }
 
 // seenItem 单个 plan_item 已输出的累积值。
@@ -107,6 +110,7 @@ func newRemoteEventStream(c *Client, a *auth.Auth, sessionID string) *remoteEven
 		sessID:       sessionID,
 		seen:         make(map[string]seenItem),
 		emittedTools: make(map[string]bool),
+		emittedResults: make(map[string]bool),
 	}
 }
 
@@ -363,8 +367,57 @@ func (s *remoteEventStream) mapPlanItem(raw []byte) []RemoteEventDelta {
 				out = append(out, RemoteEventDelta{ToolLine: line})
 			}
 		}
+		// 工具结果回传（对齐 codex-proxy 的 result 转发）：同一工具
+		// 首次携带非空 result 时输出 ✅ 结果行，让客户端看到 MCP 执行
+		// 完成及结果摘要——否则工具执行过程完全不可见，文本全堆一起。
+		if tci.Result != nil && len(tci.Result) > 2 && !s.emittedResults[tci.ID] {
+			if line := formatToolResult(tci); line != "" {
+				s.emittedResults[tci.ID] = true
+				out = append(out, RemoteEventDelta{ToolLine: line})
+			}
+		}
 	}
 	return out
+}
+
+// formatToolResult 把工具 result 渲染成结果回传行。
+// MCP 工具（run_mcp）：✅ 工具名 → 结果摘要（stdout/内容前 200 字）。
+// 其余沙盒工具：✅ 结果摘要。返回空串表示无需外显。
+func formatToolResult(t *planToolCall) string {
+	name := t.Name
+	var summary string
+	switch name {
+	case "run_mcp":
+		var p struct {
+			ToolName string `json:"tool_name"`
+		}
+		_ = json.Unmarshal(t.Params, &p)
+		if p.ToolName != "" {
+			name = p.ToolName
+		}
+	}
+	// 结果摘要：优先取常见字段，否则截 JSON。
+	raw := string(t.Result)
+	var m map[string]any
+	if json.Unmarshal(t.Result, &m) == nil {
+		if v, ok := m["content"].(string); ok && v != "" {
+			summary = v
+		} else if v, ok := m["output"].(string); ok && v != "" {
+			summary = v
+		} else if v, ok := m["stdout"].(string); ok && v != "" {
+			summary = v
+		} else if v, ok := m["result"].(string); ok && v != "" {
+			summary = v
+		}
+	}
+	if summary == "" {
+		summary = raw
+	}
+	summary = oneLine(summary, 200)
+	if summary == "" {
+		return ""
+	}
+	return "\n\n> ✅ [" + name + "] " + summary + "\n"
 }
 
 // formatToolLine 把工具调用渲染成与一期风格统一的注记行。
