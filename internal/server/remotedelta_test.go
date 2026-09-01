@@ -119,3 +119,15 @@ func TestToolKeyFromLine(t *testing.T) {
 		}
 	}
 }
+
+func TestWriteRemoteDeltaToolResult(t *testing.T) {
+	var sb strings.Builder
+	writeRemoteDelta(&sb, "id", 1, "m", upstream.RemoteEventDelta{ToolResult: "\n\n> ✅ [read_file] 文件内容摘要\n"})
+	got := sb.String()
+	if !strings.Contains(got, "read_file") {
+		t.Fatalf("工具结果应写入 content: %q", got)
+	}
+	if strings.Contains(got, "tool_calls") {
+		t.Errorf("工具结果不应走 tool_calls（应走 content 文本）: %q", got)
+	}
+}

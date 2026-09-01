@@ -71,8 +71,10 @@ type RemoteEventDelta struct {
 	Content string
 	// Reasoning 思考过程增量 → delta.reasoning_content。
 	Reasoning string
-	// ToolLine 工具调用注记行 → delta.content（与一期 🔧 行风格统一）。
+	// ToolLine 工具调用注记行 → delta.tool_calls（结构化工具调用帧，🔧）。
 	ToolLine string
+	// ToolResult 工具结果回传行 → delta.content（✅ 结果帧，客户端显示为文本）。
+	ToolResult string
 }
 
 // remoteEventStream 事件流客户端：负责拨流、断线重连、事件 → delta 映射。
@@ -373,7 +375,7 @@ func (s *remoteEventStream) mapPlanItem(raw []byte) []RemoteEventDelta {
 		if tci.Result != nil && len(tci.Result) > 2 && !s.emittedResults[tci.ID] {
 			if line := formatToolResult(tci); line != "" {
 				s.emittedResults[tci.ID] = true
-				out = append(out, RemoteEventDelta{ToolLine: line})
+				out = append(out, RemoteEventDelta{ToolResult: line})
 			}
 		}
 	}

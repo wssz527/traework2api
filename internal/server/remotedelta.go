@@ -25,6 +25,9 @@ func writeRemoteDelta(w io.Writer, id string, created int64, model string, d ups
 		// 工具调用走 OpenAI 流式结构化字段 delta.tool_calls，
 		// 客户端正确显示为「工具调用」而非普通文本。
 		writeChunkWithToolCall(w, id, created, model, d.ToolLine)
+	case d.ToolResult != "":
+		// 工具结果回传走 content 文本（✅ 行），客户端显示为执行结果。
+		writeChatChunk(w, id, created, model, "", d.ToolResult, nil)
 	}
 }
 
