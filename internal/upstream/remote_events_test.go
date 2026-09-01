@@ -354,3 +354,98 @@ func TestRemoteEpEventsFormat(t *testing.T) {
 		t.Fatalf("端点=%q", got)
 	}
 }
+
+// TestFormatToolResultMCPEnvelope 工具结果摘要：真实 TRAE 信封（嵌套
+// data.content[].text）必须解包出可读文本，而非原样 dump 整个 JSON。
+// 回归背景：run_shell 等本地 MCP 工具的结果到达 plan_item 时被 TRAE 包成
+// {status,error_message,data:{content:[{type:"text",text:...}]}}，旧逻辑
+// 只认顶层字符串字段，全部 miss 后走 raw-JSON 兜底，客户端刷出巨丑转义块。
+func TestFormatToolResultMCPEnvelope(t *testing.T) {
+	// ① 真实形状：TRAE 信封 + 标准 MCP content 数组
+	env := &planToolCall{
+		ID:   "t1",
+		Name: "run_mcp",
+		Params: []byte(`{"server_label":"本地工作区","tool_name":"run_shell","args":{"command":"ls"}}`),
+		Result: []byte(`{"status":"success","error_message":"","data":{"content":[{"type":"text","text":"exit=0\nmain.go\nREADME.md\n"}]}}`),
+	}
+	line := formatToolResult(env)
+	if !strings.Contains(line, "exit=0") || !strings.Contains(line, "main.go") {
+		t.Errorf("应解包 data.content[].text 的真实输出: %q", line)
+	}
+	if strings.Contains(line, `"status"`) || strings.Contains(line, `error_message`) {
+		t.Errorf("不得残留 JSON 信封字段: %q", line)
+	}
+	if !strings.Contains(line, "✅") || !strings.Contains(line, "run_shell") {
+		t.Errorf("应保持 ✅ [工具名] 风格: %q", line)
+	}
+
+	// ② 失败结果：status!=success → ❌ + error_message
+	fail := &planToolCall{
+		ID:   "t2",
+		Name: "run_mcp",
+		Params: []byte(`{"tool_name":"run_shell"}`),
+		Result: []byte(`{"status":"error","error_message":"permission denied","data":null}`),
+	}
+	fline := formatToolResult(fail)
+	if !strings.Contains(fline, "❌") || !strings.Contains(fline, "permission denied") {
+		t.Errorf("失败结果应 ❌ 且带 error_message: %q", fline)
+	}
+
+	// ③ 兼容：顶层 content 字符串（旧路径）仍可用
+	legacy := &planToolCall{
+		ID:     "t3",
+		Name:   "run_mcp",
+		Params: []byte(`{"tool_name":"read_file"}`),
+		Result: []byte(`{"content":"package main"}`),
+	}
+	if lline := formatToolResult(legacy); !strings.Contains(lline, "package main") {
+		t.Errorf("顶层 content 字符串应保留: %q", lline)
+	}
+
+	// ④ 非 JSON 纯文本结果原样保留
+	plain := &planToolCall{
+		ID:     "t4",
+		Name:   "run_shell",
+		Params: []byte(`{}`),
+		Result: []byte(`"exit=0\nhello"`),
+	}
+	if pline := formatToolResult(plain); !strings.Contains(pline, "hello") {
+		t.Errorf("纯文本结果应保留: %q", pline)
+	}
+}
+
+// TestFormatToolResultEmptyShells 空壳结果帧不应外显（回归：finish /
+// EnvironmentSetup 的收尾空结果被 raw-JSON 兜底刷成零信息行）。
+func TestFormatToolResultEmptyShells(t *testing.T) {
+	cases := []struct {
+		note string
+		raw  string
+	}{
+		{"finish 空收尾", `{"data":{"products":null,"summary":""},"error_message":"","images":null,"interrupt":null,"is_truncated":null,"render":null,"status":"success"}`},
+		{"Read 空信封", `{"error_message":"","images":null,"interrupt":null,"is_truncated":false,"render":null,"status":"success"}`},
+		{"EnvironmentSetup 空壳", `{"data":{"command":null,"command_id":"","cwd":null,"exit_code":0,"pid":null,"sandbox_status":null,"status":null},"error_message":"","status":"success"}`},
+		{"失败但无信息", `{"status":"error","error_message":""}`},
+	}
+	for _, c := range cases {
+		tc := &planToolCall{ID: "x", Name: "run_mcp", Params: []byte(`{"tool_name":"Read"}`), Result: []byte(c.raw)}
+		if got := formatToolResult(tc); got != "" {
+			t.Errorf("%s: 空壳结果应不外显, got %q", c.note, got)
+		}
+	}
+}
+
+// TestFormatToolResultSandboxShapes 沙盒工具真实形态（2026-09-01 探针帧）。
+func TestFormatToolResultSandboxShapes(t *testing.T) {
+	// EnvironmentSetup：文本藏在 data.stderr（MCP 状态输出）
+	env := &planToolCall{
+		ID: "e1", Name: "EnvironmentSetup", Params: []byte(`{}`),
+		Result: []byte(`{"status":"success","error_message":"","data":{"terminal_id":0,"command_id":"","pid":null,"stdout":"","stderr":"MCP Servers:\n  ✓ 本地工作区 - running (14 tools)","exit_code":0,"command":null},"render":null}`),
+	}
+	if got := formatToolResult(env); !strings.Contains(got, "本地工作区 - running") {
+		t.Errorf("EnvironmentSetup 应提取 data.stderr: %q", got)
+	}
+	// 空壳 {}（Read/run_mcp 首帧）不外显
+	if got := formatToolResult(&planToolCall{ID: "e2", Name: "Read", Params: []byte(`{}`), Result: []byte(`{}`)}); got != "" {
+		t.Errorf("空 result 应不外显: %q", got)
+	}
+}

@@ -400,43 +400,127 @@ func (s *remoteEventStream) mapPlanItem(raw []byte) []RemoteEventDelta {
 }
 
 // formatToolResult 把工具 result 渲染成结果回传行。
-// MCP 工具（run_mcp）：✅ 工具名 → 结果摘要（stdout/内容前 200 字）。
+// MCP 工具（run_mcp）：✅/❌ 工具名 → 结果摘要（前 200 字）。
 // 其余沙盒工具：✅ 结果摘要。返回空串表示无需外显。
+//
+// 结果信封有多层形态，按序解包到纯文本：
+//  1. TRAE 包装层 {status, error_message, data:{content:[...]}}（run_shell 实测）
+//  2. 标准 MCP {content:[{type:"text",text}]}（顶层）
+//  3. 顶层字符串字段 content/output/stdout/result（旧路径）
+//  4. 非 JSON → 原样
+// status!="success" 时用 ❌ 并优先展示 error_message。
 func formatToolResult(t *planToolCall) string {
 	name := t.Name
-	var summary string
-	switch name {
-	case "run_mcp":
-		var p struct {
-			ToolName string `json:"tool_name"`
-		}
-		_ = json.Unmarshal(t.Params, &p)
-		if p.ToolName != "" {
-			name = p.ToolName
-		}
+	var p struct {
+		ToolName string `json:"tool_name"`
 	}
-	// 结果摘要：优先取常见字段，否则截 JSON。
-	raw := string(t.Result)
-	var m map[string]any
-	if json.Unmarshal(t.Result, &m) == nil {
-		if v, ok := m["content"].(string); ok && v != "" {
-			summary = v
-		} else if v, ok := m["output"].(string); ok && v != "" {
-			summary = v
-		} else if v, ok := m["stdout"].(string); ok && v != "" {
-			summary = v
-		} else if v, ok := m["result"].(string); ok && v != "" {
-			summary = v
-		}
+	if err := json.Unmarshal(t.Params, &p); err == nil && p.ToolName != "" {
+		name = p.ToolName
 	}
-	if summary == "" {
-		summary = raw
-	}
-	summary = oneLine(summary, 200)
+	summary, failed := resultSummary(t.Result)
 	if summary == "" {
 		return ""
 	}
-	return "\n\n> ✅ [" + name + "] " + summary + "\n"
+	icon := "✅"
+	if failed {
+		icon = "❌"
+	}
+	return "\n\n> " + icon + " [" + name + "] " + oneLine(summary, 200) + "\n"
+}
+
+// resultSummary 从工具 result 原始 JSON 提取可读文本摘要。
+// 第二个返回值表示结果是否失败（status 存在且非 success）。
+// 返回空串表示无外显价值（空壳帧：全 null/空串字段，如 finish/EnvironmentSetup
+// 的收尾空结果），调用方应整体跳过，避免刷出零信息 JSON 行。
+func resultSummary(raw []byte) (string, bool) {
+	failed := false
+	if len(raw) == 0 {
+		return "", failed
+	}
+	var top map[string]any
+	if json.Unmarshal(raw, &top) != nil || top == nil {
+		// 非 JSON：剥引号当纯文本
+		return strings.Trim(string(raw), `"`), failed
+	}
+	if v, ok := top["status"].(string); ok && v != "" && v != "success" {
+		failed = true
+	}
+	// ① TRAE 包装层：data.content[] 优先；沙盒 shell 类工具的信息在
+	// data.stdout / data.stderr（如 EnvironmentSetup 的「MCP Servers: ✓ ...」）。
+	if data, ok := top["data"].(map[string]any); ok {
+		if s := mcpContentText(data["content"]); s != "" {
+			if !failed {
+				return s, failed
+			}
+			// 失败但 data 里仍有文本：保留， error_message 前置
+			if em, _ := top["error_message"].(string); em != "" {
+				return em + "\n" + s, failed
+			}
+			return s, failed
+		}
+		if s := firstNonEmpty(data["stdout"], data["stderr"]); s != "" {
+			return s, failed
+		}
+	}
+	// 失败且无 data 文本：error_message 就是摘要
+	if failed {
+		if em, _ := top["error_message"].(string); em != "" {
+			return em, failed
+		}
+		return "", failed // 失败但无任何信息（如 error_message 为空）：不外显
+	}
+	// ② 标准 MCP 顶层 content 数组或字符串（旧路径）
+	switch c := top["content"].(type) {
+	case string:
+		if c != "" {
+			return c, failed
+		}
+	default:
+		if s := mcpContentText(c); s != "" {
+			return s, failed
+		}
+	}
+	// ③ 顶层字符串字段
+	for _, k := range []string{"output", "stdout", "result"} {
+		if v, ok := top[k].(string); ok && v != "" {
+			return v, failed
+		}
+	}
+	// ④ 空壳判定：解到最后既无文本字段也无有价值信息——返回空让调用方跳过，
+	// 不再走「Marshal 整个信封」的兜底（正是截图里 ✅ [Read] {"error_message":"",...}
+	// 这类零信息行的来源）。
+	return "", failed
+}
+
+// mcpContentText 从 MCP content 数组提取全部 text 段拼接。
+// 兼容三种元素形态：{type:"text",text}（标准）、纯字符串、其他类型跳过。
+func mcpContentText(v any) string {
+	arr, ok := v.([]any)
+	if !ok {
+		return ""
+	}
+	var b strings.Builder
+	for _, it := range arr {
+		switch e := it.(type) {
+		case map[string]any:
+			if s, ok := e["text"].(string); ok {
+				b.WriteString(s)
+			}
+		case string:
+			b.WriteString(e)
+		}
+	}
+	return b.String()
+}
+
+// firstNonEmpty 返回 v 中第一个非空字符串（stdin/stderr 双通道取值用）。
+func firstNonEmpty(vs ...any) string {
+	for _, v := range vs {
+		if s, ok := v.(string); ok && s != "" {
+			return s
+		}
+	}
+	return ""
 }
 
 // formatToolLine 把工具调用渲染成与一期风格统一的注记行。
