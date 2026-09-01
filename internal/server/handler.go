@@ -35,6 +35,9 @@ type Config struct {
 	// ConvStorePath 会话注册表落盘路径（P1）。空 = "data/conversations.json"；
 	// "-" = 禁用会话复用（连同 env TW2API_DISABLE_CONV_REUSE=1）。
 	ConvStorePath string
+	// RemoteModels 走 remote（云端沙盒/Work 积分）通道的模型白名单。
+	// 空 = 使用内置默认 cloudAgentModels。
+	RemoteModels []string
 }
 
 // maxBodyBytes 请求体大小上限（8MB），超过返回 413。
@@ -270,6 +273,7 @@ func (h *Handler) modelList() []map[string]any {
 				"created":        1753600000,
 				"owned_by":       "trae-solo",
 				"context_length": mi.ContextWindow,
+				"x_channel":      h.channelOf(mi.ID),
 			}
 			if entry["context_length"] == 0 {
 				entry["context_length"] = 131072
@@ -283,7 +287,7 @@ func (h *Handler) modelList() []map[string]any {
 			out = append(out, map[string]any{
 				"id": mi.ID + "-max", "object": "model", "created": 1753600000,
 				"owned_by": "trae-solo", "context_length": entry["context_length"],
-				"max_mode": true,
+				"max_mode": true, "x_channel": h.channelOf(mi.ID),
 			})
 		}
 		return out
@@ -291,7 +295,14 @@ func (h *Handler) modelList() []map[string]any {
 	return staticModels
 }
 
-// fetchDynamicModels 从池中任一健康账号拉模型列表（get_detail_param），缓存 1h。
+// channelOf 返回模型所属通道：remote（云端沙盒/Work 积分）或 legacy（通用积分）。
+func (h *Handler) channelOf(model string) string {
+	if h.isCloudAgentModel(model) {
+		return "remote"
+	}
+	return "legacy"
+}
+
 func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 	dynamicModelsCache.RLock()
 	if len(dynamicModelsCache.ids) > 0 && time.Since(dynamicModelsCache.fetched) < dynamicModelsTTL {
@@ -368,7 +379,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	//   useRemote=false（默认）→ 走老通道 llm_utils_chat（通用积分，每日恢复）
 	//   老通道 4008（通用积分耗尽）→ useRemote=true 降级 remote 通道（Work 积分）
 	//   glm-5.3 这类老通道拉不到模型的，直接走 remote。
-	useRemote := isCloudAgentModel(configName) // 强制 remote 的模型（老通道模型表没有的）
+	useRemote := h.isCloudAgentModel(configName) // 强制 remote 的模型（老通道模型表没有的）
 
 	tried := map[string]bool{}
 	var lastErr error
@@ -546,15 +557,26 @@ func (h *Handler) handleStreamError(uid string, se *upstream.SOLOStreamError) {
 // cloud_agent 模型路由
 // ---------------------------------------------------------------------------
 
-// cloudAgentModels 需要走 create_agent_task（cloud_agent 通道，Work 专属积分）
-// 的模型集合。当前已知 glm-5.3（模型表里 marked cloud_agent）；后续可扩展。
-// 不在集合内的模型（DeepSeek 等）继续走 llm_utils_chat 老通道。
+// cloudAgentModels 需要走 remote（cloud_agent 通道，Work 专属积分）
+// 的模型集合默认值。可通过 Config.RemoteModels 覆盖（config.json 配
+// remote_models）。不在集合内的模型继续走 llm_utils_chat 老通道。
 var cloudAgentModels = map[string]bool{
 	"glm-5.3": true,
+	// DeepSeek-V4-Flash-Official 走云端沙盒通道（remote，Work 积分），
+	// 用于会话连续性测试；不进老通道通用积分。
+	"DeepSeek-V4-Flash-Official": true,
 }
 
 // isCloudAgentModel 判断 model（已 map 后的 config_name）是否走 cloud_agent 通道。
-func isCloudAgentModel(model string) bool {
+func (h *Handler) isCloudAgentModel(model string) bool {
+	if len(h.cfg.RemoteModels) > 0 {
+		for _, m := range h.cfg.RemoteModels {
+			if m == model {
+				return true
+			}
+		}
+		return false
+	}
 	return cloudAgentModels[model]
 }
 

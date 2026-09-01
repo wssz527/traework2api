@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -712,24 +713,15 @@ func jsonHTTPResponse(status int, body string) *http.Response {
 
 func TestChatDeepSeekStaysOnLegacyChannel(t *testing.T) {
 	snapshotDynamicModelsCache(t)
-	gotPath := ""
-	up := &upstream.Client{
-		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-			gotPath = r.URL.Path
-			return &http.Response{
-				StatusCode: 200,
-				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
-				Body:       io.NopCloser(strings.NewReader(soloSSE)),
-			}, nil
-		})},
-		AgentHost: "https://fake.example",
-		UgHost:    "https://fake.example",
-		OAuthHost: "https://fake.example",
-		ClientID:  upstream.ClientID,
-	}
+	var mu sync.Mutex
+	var creates int
+	sends := map[string]int{}
+	lastText := map[string]string{}
+	up := convReuseFakeUpstream(t, &mu, &creates, sends, lastText, false)
 	h := NewHandler(Config{
-		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
-		Upstream: up,
+		Pool:          testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream:      up,
+		ConvStorePath: isolatedConvStore(),
 	})
 	req := httptest.NewRequest("POST", "/v1/chat/completions",
 		strings.NewReader(`{"model":"DeepSeek-V4-Flash-Official","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
@@ -738,8 +730,9 @@ func TestChatDeepSeekStaysOnLegacyChannel(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
-	if gotPath != "/api/agent/v3/llm_utils_chat" {
-		t.Errorf("DeepSeek should stay on llm_utils_chat, got path=%q", gotPath)
+	// DeepSeek-V4-Flash-Official 已加入 cloudAgentModels，走 remote 通道（云端沙盒）。
+	if creates != 1 {
+		t.Errorf("DeepSeek should go remote (cloud sandbox), creates=%d want 1", creates)
 	}
 }
 

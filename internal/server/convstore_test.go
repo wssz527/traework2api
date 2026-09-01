@@ -181,7 +181,7 @@ func convReuseFakeUpstream(t *testing.T, mu *sync.Mutex, creates *int, sends map
 			defer mu.Unlock()
 			switch {
 			case r.Method == http.MethodPost && r.URL.Path == "/api/ide/v1/get_detail_param":
-				return jsonHTTPResponse(200, `{"config_info_list":[{"config_name":"glm-5.3"}]}`), nil
+				return jsonHTTPResponse(200, `{"config_info_list":[{"config_name":"glm-5.3"},{"config_name":"DeepSeek-V4-Flash-Official"}]}`), nil
 			case r.Method == http.MethodPost && r.URL.Path == "/api/remote/v1/chat_sessions":
 				createsN++
 				*creates = createsN
