@@ -12,6 +12,57 @@ import (
 	"traework2api/internal/auth"
 )
 
+// TestRemoteSendMessageMaxStrategy P0：maxMode=true 时发消息 body 顶层
+// model_selection_strategy 必须是 "max"；false 时必须保持模板原样 "manual"。
+func TestRemoteSendMessageMaxStrategy(t *testing.T) {
+	var gotStrategy string
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		raw, _ := io.ReadAll(r.Body)
+		var body map[string]any
+		if err := json.Unmarshal(raw, &body); err != nil {
+			t.Fatalf("body: %v", err)
+		}
+		gotStrategy, _ = body["model_selection_strategy"].(string)
+		return jsonResp(200, `{"code":0,"data":{"message_id":"m1","accepted":true}}`), nil
+	})
+	a := &auth.Auth{AccessToken: "at", UID: "u1", DeviceID: "d1", MachineID: "m1"}
+
+	if _, err := c.RemoteSendMessage(a, "s1", "glm-5.3", "hi", true); err != nil {
+		t.Fatal(err)
+	}
+	if gotStrategy != "max" {
+		t.Errorf("maxMode=true: strategy=%q want max", gotStrategy)
+	}
+	if _, err := c.RemoteSendMessage(a, "s1", "glm-5.3", "hi", false); err != nil {
+		t.Fatal(err)
+	}
+	if gotStrategy != "manual" {
+		t.Errorf("maxMode=false: strategy=%q want manual（非 Max 请求行为不得改变）", gotStrategy)
+	}
+}
+
+func TestSplitMaxSuffix(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+		max  bool
+	}{
+		{"glm-5.3-max", "glm-5.3", true},
+		{"DeepSeek-V4-Flash-Official-max", "DeepSeek-V4-Flash-Official", true},
+		{"glm-5.3", "glm-5.3", false},
+		{"", "", false},
+		{"-max", "-max", false}, // 纯后缀不是合法模型名
+		{"glm-max", "glm", true},
+		{"max", "max", false},
+	}
+	for _, tc := range cases {
+		got, isMax := SplitMaxSuffix(tc.in)
+		if got != tc.want || isMax != tc.max {
+			t.Errorf("SplitMaxSuffix(%q) = (%q,%v) want (%q,%v)", tc.in, got, isMax, tc.want, tc.max)
+		}
+	}
+}
+
 func TestRemoteSendMessageEncodesQueryAsJSON(t *testing.T) {
 	const userText = "他说\"好\"\n路径\\tmp"
 	var gotBody map[string]any
@@ -29,7 +80,7 @@ func TestRemoteSendMessageEncodesQueryAsJSON(t *testing.T) {
 		MachineID:   "machine-2",
 	}
 
-	if _, err := c.RemoteSendMessage(a, "session-1", "glm-5.3", userText); err != nil {
+	if _, err := c.RemoteSendMessage(a, "session-1", "glm-5.3", userText, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -66,7 +117,7 @@ func TestRemoteSendMessageUsesSelectedAccountIdentity(t *testing.T) {
 		MachineID:   "machine-2",
 	}
 
-	if _, err := c.RemoteSendMessage(a, "session-1", "glm-5.3", "OK"); err != nil {
+	if _, err := c.RemoteSendMessage(a, "session-1", "glm-5.3", "OK", false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -97,7 +148,7 @@ func TestRemoteSendMessageParallelLimitIsRetryableBusy(t *testing.T) {
 	})
 	a := &auth.Auth{AccessToken: "at", UID: "u1", DeviceID: "d1", MachineID: "m1"}
 
-	_, err := c.RemoteSendMessage(a, "s1", "glm-5.3", "hi")
+	_, err := c.RemoteSendMessage(a, "s1", "glm-5.3", "hi", false)
 	if !errors.Is(err, ErrRemoteBusy) {
 		t.Fatalf("err=%v want ErrRemoteBusy", err)
 	}

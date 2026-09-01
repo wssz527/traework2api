@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -57,6 +59,47 @@ func testPoolWith(auths ...*auth.Auth) *pool.Pool {
 		p.SetCredits(a.UID, 1000)
 	}
 	return p
+}
+
+// newOfflineUpstream 返回指向本地死端口的 Client。冷缓存时 mapModel 会经
+// fetchDynamicModels 真实出网拉模型表（测试池是假 token，必失败但依赖外网
+// 且慢）；三个 host 指到 127.0.0.1:1 立刻连接拒绝走静态回退，单测完全
+// 离线且行为不变。
+func newOfflineUpstream() *upstream.Client {
+	c := upstream.New()
+	c.AgentHost = "http://127.0.0.1:1"
+	c.UgHost = "http://127.0.0.1:1"
+	c.OAuthHost = "http://127.0.0.1:1"
+	return c
+}
+
+// snapshotDynamicModelsCache 隔离全局动态模型缓存：测试开始时清空、
+// 结束时恢复原快照。多 个用例的 get_detail_param mock 各自返回不同模型表，而
+// dynamicModelsCache 是包级全局（成功 TTL 1h / 失败负缓存 5min）——
+// 只恢复不 清空的话，先跑用例的模型表（以及失败留下的 lastFail）会污染
+// 本用例；清空后本 用例的 mock 表独立生效，结束时原样还原全局状态。
+func snapshotDynamicModelsCache(t *testing.T) {
+	t.Helper()
+	dynamicModelsCache.Lock()
+	ids, fetched, lastFail := dynamicModelsCache.ids, dynamicModelsCache.fetched, dynamicModelsCache.lastFail
+	dynamicModelsCache.ids, dynamicModelsCache.fetched, dynamicModelsCache.lastFail = nil, time.Time{}, time.Time{}
+	dynamicModelsCache.Unlock()
+	t.Cleanup(func() {
+		dynamicModelsCache.Lock()
+		dynamicModelsCache.ids, dynamicModelsCache.fetched, dynamicModelsCache.lastFail = ids, fetched, lastFail
+		dynamicModelsCache.Unlock()
+	})
+}
+
+// isolatedConvStore 隔离会话注册表：ConvStorePath 指向独立临时目录下的
+// conversations.json，避免用例读写共享的 data/conversations.json（跨用例/跨
+// 运行的绑定残留会让 turn1 直接命中旧会话、跳过建会话，导致 creates 断言失败）。
+// 每次调用生成新目录，同用例内多个 handler 也不共享注册表。
+var isolatedConvStoreSeq int
+
+func isolatedConvStore() string {
+	isolatedConvStoreSeq++
+	return filepath.Join(os.TempDir(), fmt.Sprintf("tw2api-conv-test-%d-%d", os.Getpid(), isolatedConvStoreSeq), "conversations.json")
 }
 
 func TestChatNonStreamAggregates(t *testing.T) {
@@ -254,8 +297,38 @@ func TestChatSessionDeadDisables(t *testing.T) {
 	}
 }
 
+// TestMapModelMaxSuffix P0："-max" 后缀剥离与 maxMode 返回。
+func TestMapModelMaxSuffix(t *testing.T) {
+	snapshotDynamicModelsCache(t)
+	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}), Upstream: newOfflineUpstream()})
+	cases := []struct {
+		in    string
+		want  string
+		isMax bool
+	}{
+		{"glm-5.3", "glm-5.3", false},
+		{"glm-5.3-max", "glm-5.3", true},
+		{"DeepSeek-V4-Flash-Official-max", "DeepSeek-V4-Flash-Official", true},
+		{"glm-5.3__dev", "glm-5.3", false},
+		{"", "glm-5.2", false}, // 默认模型
+	}
+	for _, tc := range cases {
+		got, isMax, err := h.mapModel(tc.in)
+		if err != nil {
+			t.Errorf("mapModel(%q): %v", tc.in, err)
+			continue
+		}
+		if got != tc.want || isMax != tc.isMax {
+			t.Errorf("mapModel(%q) = (%q,%v) want (%q,%v)", tc.in, got, isMax, tc.want, tc.isMax)
+		}
+	}
+	if _, _, err := h.mapModel("does-not-exist-max"); err == nil {
+		t.Error("未知模型带 -max 后缀也应 400")
+	}
+}
+
 func TestChatUnknownModel400(t *testing.T) {
-	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}), Upstream: upstream.New()})
+	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}), Upstream: newOfflineUpstream()})
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"does-not-exist-xyz","messages":[]}`))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -270,7 +343,7 @@ func TestChatUnknownModel400(t *testing.T) {
 }
 
 func TestModelsEndpoint(t *testing.T) {
-	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}), Upstream: upstream.New()})
+	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}), Upstream: newOfflineUpstream()})
 	req := httptest.NewRequest("GET", "/v1/models", nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -300,7 +373,7 @@ func TestModelsEndpoint(t *testing.T) {
 func TestAPIKeyAuth(t *testing.T) {
 	h := NewHandler(Config{
 		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}),
-		Upstream: upstream.New(),
+		Upstream: newOfflineUpstream(),
 		APIKey:   "test-key",
 	})
 	// 无 key → 401
@@ -329,7 +402,7 @@ func TestAPIKeyAuth(t *testing.T) {
 }
 
 func TestRequestBodyTooLarge(t *testing.T) {
-	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}), Upstream: upstream.New()})
+	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}), Upstream: newOfflineUpstream()})
 	big := strings.Repeat("a", maxBodyBytes+1)
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(big))
 	rec := httptest.NewRecorder()
@@ -347,7 +420,7 @@ func TestRequestBodyTooLarge(t *testing.T) {
 func TestAPIKeyAuthCaseInsensitivePrefix(t *testing.T) {
 	h := NewHandler(Config{
 		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}),
-		Upstream: upstream.New(),
+		Upstream: newOfflineUpstream(),
 		APIKey:   "test-key",
 	})
 	// 大小写不同的 Bearer 前缀也应接受（按规范，前缀大小写不敏感）。
@@ -371,7 +444,7 @@ func TestAPIKeyAuthCaseInsensitivePrefix(t *testing.T) {
 func TestStatusEndpoint(t *testing.T) {
 	p := testPoolWith(&auth.Auth{UID: "u1", Nickname: "nick", AccessToken: "at", ExpiresAt: 9999999999})
 	p.SetCredits("u1", 42)
-	h := NewHandler(Config{Pool: p, Upstream: upstream.New()})
+	h := NewHandler(Config{Pool: p, Upstream: newOfflineUpstream()})
 	req := httptest.NewRequest("GET", "/status", nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -388,7 +461,7 @@ func TestStatusEndpoint(t *testing.T) {
 }
 
 func TestHealthz(t *testing.T) {
-	h := NewHandler(Config{Pool: pool.New(""), Upstream: upstream.New()})
+	h := NewHandler(Config{Pool: pool.New(""), Upstream: newOfflineUpstream()})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/healthz", nil))
 	if rec.Code != 200 {
@@ -397,11 +470,14 @@ func TestHealthz(t *testing.T) {
 }
 
 func TestChatGLM53RoutesThroughRemoteSession(t *testing.T) {
+	snapshotDynamicModelsCache(t) // 隔离全局动态模型缓存：本用例自己 mock get_detail_param
 	var gotPaths []string
 	up := &upstream.Client{
 		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 			gotPaths = append(gotPaths, r.Method+" "+r.URL.Path)
 			switch {
+			case r.Method == http.MethodPost && r.URL.Path == "/api/ide/v1/get_detail_param":
+				return jsonHTTPResponse(200, `{"config_info_list":[{"config_name":"glm-5.3"}]}`), nil
 			case r.Method == http.MethodPost && r.URL.Path == "/api/remote/v1/chat_sessions":
 				return jsonHTTPResponse(200, `{"code":0,"data":{"chat_session_id":"s1"}}`), nil
 			case r.Method == http.MethodPost && r.URL.Path == "/api/remote/v1/chat_sessions/s1/messages":
@@ -421,8 +497,9 @@ func TestChatGLM53RoutesThroughRemoteSession(t *testing.T) {
 		ClientID:  upstream.ClientID,
 	}
 	h := NewHandler(Config{
-		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
-		Upstream: up,
+		Pool:          testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream:      up,
+		ConvStorePath: "-",
 	})
 	req := httptest.NewRequest("POST", "/v1/chat/completions",
 		strings.NewReader(`{"model":"glm-5.3","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
@@ -432,6 +509,7 @@ func TestChatGLM53RoutesThroughRemoteSession(t *testing.T) {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
 	wantPaths := []string{
+		"POST /api/ide/v1/get_detail_param",
 		"POST /api/remote/v1/chat_sessions",
 		"POST /api/remote/v1/chat_sessions/s1/messages",
 		"GET /api/remote/v1/chat_sessions/s1/messages",
@@ -448,12 +526,19 @@ func TestChatGLM53RoutesThroughRemoteSession(t *testing.T) {
 func remoteTestHook() (restore func()) {
 	oldWait, oldKeep, oldBusy := remoteWaitTotal, remoteKeepaliveInterval, remoteBusyRetryWait
 	remoteWaitTotal, remoteKeepaliveInterval, remoteBusyRetryWait = 200*time.Millisecond, 20*time.Millisecond, 10*time.Millisecond
-	return func() { remoteWaitTotal, remoteKeepaliveInterval, remoteBusyRetryWait = oldWait, oldKeep, oldBusy }
+	// P0 事件流拨号走 remoteHost；单测里指向本地死端口使其立即失败、
+	// 静默降级——不出网、不拖慢用例、也不受外部网络环境干扰。
+	restoreHost := upstream.SetRemoteHost("http://127.0.0.1:1")
+	return func() {
+		remoteWaitTotal, remoteKeepaliveInterval, remoteBusyRetryWait = oldWait, oldKeep, oldBusy
+		restoreHost()
+	}
 }
 
 // TestChatRemoteStreamTimeoutEmitsKeepaliveAndError 任务迟迟不完成时：
 
 func TestChatRemoteStreamTimeoutEmitsKeepaliveAndError(t *testing.T) {
+	snapshotDynamicModelsCache(t)
 	restore := remoteTestHook()
 	defer restore()
 	var creates, deletes int
@@ -467,6 +552,9 @@ func TestChatRemoteStreamTimeoutEmitsKeepaliveAndError(t *testing.T) {
 				return jsonHTTPResponse(200, `{"code":0,"data":{"message_id":"m1","accepted":true}}`), nil
 			case r.Method == http.MethodGet && r.URL.Path == "/api/remote/v1/chat_sessions/s1/messages":
 				return jsonHTTPResponse(200, `{"code":0,"data":{"items":[{"role":"user","status":"in_progress"}]}}`), nil
+			case r.Method == http.MethodPost && r.URL.Path == "/api/ide/v1/get_detail_param":
+				// mapModel → fetchDynamicModels 的模型表请求（与 remoteStreamTestUpstream 同款）。
+				return jsonHTTPResponse(200, `{"config_info_list":[{"config_name":"glm-5.3"}]}`), nil
 			case r.Method == http.MethodDelete && r.URL.Path == "/api/remote/v1/chat_sessions/s1":
 				deletes++
 				return jsonHTTPResponse(200, `{"code":0,"message":"success"}`), nil
@@ -484,7 +572,7 @@ func TestChatRemoteStreamTimeoutEmitsKeepaliveAndError(t *testing.T) {
 		&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999},
 		&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999},
 	)
-	h := NewHandler(Config{Pool: p, Upstream: up})
+	h := NewHandler(Config{Pool: p, Upstream: up, ConvStorePath: "-"})
 	req := httptest.NewRequest("POST", "/v1/chat/completions",
 		strings.NewReader(`{"model":"glm-5.3","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
 	rec := httptest.NewRecorder()
@@ -505,6 +593,7 @@ func TestChatRemoteStreamTimeoutEmitsKeepaliveAndError(t *testing.T) {
 // TestChatRemoteBusyRetriesThenRotates 发消息遇 429 并发槽满：
 
 func TestChatRemoteBusyRetriesThenRotates(t *testing.T) {
+	snapshotDynamicModelsCache(t)
 	restore := remoteTestHook()
 	defer restore()
 	var creates int
@@ -512,6 +601,8 @@ func TestChatRemoteBusyRetriesThenRotates(t *testing.T) {
 	up := &upstream.Client{
 		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 			switch {
+			case r.Method == http.MethodPost && r.URL.Path == "/api/ide/v1/get_detail_param":
+				return jsonHTTPResponse(200, `{"config_info_list":[{"config_name":"glm-5.3"}]}`), nil
 			case r.Method == http.MethodPost && r.URL.Path == "/api/remote/v1/chat_sessions":
 				creates++
 				return jsonHTTPResponse(200, fmt.Sprintf(`{"code":0,"data":{"chat_session_id":"s%d"}}`, creates)), nil
@@ -534,7 +625,7 @@ func TestChatRemoteBusyRetriesThenRotates(t *testing.T) {
 		&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999},
 		&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999},
 	)
-	h := NewHandler(Config{Pool: p, Upstream: up})
+	h := NewHandler(Config{Pool: p, Upstream: up, ConvStorePath: "-"})
 	req := httptest.NewRequest("POST", "/v1/chat/completions",
 		strings.NewReader(`{"model":"glm-5.3","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
 	rec := httptest.NewRecorder()
@@ -558,6 +649,7 @@ func TestChatRemoteBusyRetriesThenRotates(t *testing.T) {
 // TestChatRemoteClientDisconnectCleansSession 客户端断开后应停止轮询并删除会话，
 
 func TestChatRemoteClientDisconnectCleansSession(t *testing.T) {
+	snapshotDynamicModelsCache(t)
 	restore := remoteTestHook()
 	defer restore()
 	var deletes int
@@ -565,6 +657,8 @@ func TestChatRemoteClientDisconnectCleansSession(t *testing.T) {
 	up := &upstream.Client{
 		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 			switch {
+			case r.Method == http.MethodPost && r.URL.Path == "/api/ide/v1/get_detail_param":
+				return jsonHTTPResponse(200, `{"config_info_list":[{"config_name":"glm-5.3"}]}`), nil
 			case r.Method == http.MethodPost && r.URL.Path == "/api/remote/v1/chat_sessions":
 				return jsonHTTPResponse(200, `{"code":0,"data":{"chat_session_id":"s1"}}`), nil
 			case r.Method == http.MethodPost && r.URL.Path == "/api/remote/v1/chat_sessions/s1/messages":
@@ -585,8 +679,9 @@ func TestChatRemoteClientDisconnectCleansSession(t *testing.T) {
 		ClientID:  upstream.ClientID,
 	}
 	h := NewHandler(Config{
-		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
-		Upstream: up,
+		Pool:          testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream:      up,
+		ConvStorePath: "-",
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.3","stream":true,"messages":[{"role":"user","content":"hi"}]}`)).WithContext(ctx)
@@ -616,6 +711,7 @@ func jsonHTTPResponse(status int, body string) *http.Response {
 }
 
 func TestChatDeepSeekStaysOnLegacyChannel(t *testing.T) {
+	snapshotDynamicModelsCache(t)
 	gotPath := ""
 	up := &upstream.Client{
 		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {

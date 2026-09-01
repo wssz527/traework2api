@@ -21,6 +21,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"traework2api/internal/auth"
@@ -33,11 +34,53 @@ var ErrRemoteBusy = errors.New("remote solo agent parallel limit reached")
 // ErrRemoteTimeout 远程任务在总时限内未完成（上游重任务实测排队+执行可达 13 分钟）。
 var ErrRemoteTimeout = errors.New("remote task timeout")
 
-// RemoteHost remote 通道专用域名（客户端实测，api5-normal）
-const RemoteHost = "https://api5-normal.mchost.guru"
+// remoteHostMu 保护 remoteHost 的并发读写：事件流 goroutine 会在任务
+// 结束后仍存活片刻（drain / 重连退避），此时单测替换 host 变量会构成
+// 数据竞争（-race 下已实际命中）。
+var remoteHostMu sync.RWMutex
+
+// remoteHost remote 通道专用域名（客户端实测，api5-normal）。
+// 经 SetRemoteHost/remoteHostURL 读写而非直接赋值。
+var remoteHost = "https://api5-normal.mchost.guru"
+
+// SetRemoteHost 测试钩子：替换 remote 通道目标地址。返回还原函数。
+func SetRemoteHost(url string) (restore func()) {
+	remoteHostMu.Lock()
+	defer remoteHostMu.Unlock()
+	old := remoteHost
+	remoteHost = url
+	return func() {
+		remoteHostMu.Lock()
+		defer remoteHostMu.Unlock()
+		remoteHost = old
+	}
+}
+
+// remoteHostURL 当前 remote 通道地址（生产代码一律经此读取）。
+func remoteHostURL() string {
+	remoteHostMu.RLock()
+	defer remoteHostMu.RUnlock()
+	return remoteHost
+}
+
+// RemoteHostBase 对外（cmd 探针等外部包）导出的只读地址访问。
+func RemoteHostBase() string { return remoteHostURL() }
 
 // RemoteEpCreateSession 创建会话
 const RemoteEpCreateSession = "/api/remote/v1/chat_sessions"
+
+// maxModelSuffix 对外模型名的 Max 模式后缀（glm-5.3-max 等）。
+// 客户端带该后缀请求 = 剥后缀得真实模型名 + 发消息时 model_selection_strategy=max。
+const maxModelSuffix = "-max"
+
+// SplitMaxSuffix 解析对外模型名：带 "-max" 后缀时返回 (真实模型名, true)，
+// 否则原样返回 (model, false)。空串/纯 "-max" 不算 Max。
+func SplitMaxSuffix(model string) (string, bool) {
+	if len(model) > len(maxModelSuffix) && strings.HasSuffix(model, maxModelSuffix) {
+		return model[:len(model)-len(maxModelSuffix)], true
+	}
+	return model, false
+}
 
 // RemoteEpMessages 发消息/查消息
 const RemoteEpMessages = "/api/remote/v1/chat_sessions/%s/messages"
@@ -96,7 +139,7 @@ func RemoteCustomModel(model string) map[string]any {
 // agent_type 必须携带，否则任务不会真正启动。
 func (c *Client) RemoteCreateSession(a *auth.Auth) (string, error) {
 	body, _ := json.Marshal(map[string]any{"mode": "work", "agent_type": "solo_work_lite", "title": "kimi-proxy"})
-	req, err := http.NewRequest(http.MethodPost, RemoteHost+RemoteEpCreateSession, bytes.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, remoteHostURL()+RemoteEpCreateSession, bytes.NewReader(body))
 	if err != nil {
 		return "", err
 	}
@@ -127,7 +170,10 @@ func (c *Client) RemoteCreateSession(a *auth.Auth) (string, error) {
 
 // RemoteSendMessage 发送消息，返回 message_id。
 // 使用客户端真实模板（一字不差），只替换模型名和 query。
-func (c *Client) RemoteSendMessage(a *auth.Auth, sessionID, model, userText string) (string, error) {
+// maxMode 为 true 时顶层 model_selection_strategy 置 "max"（Trae SOLO 长上下文
+// Max 模式，逆向结论 2026-08-31：Max 开关只改这一个字段），否则保持模板
+// 原样 "manual"。
+func (c *Client) RemoteSendMessage(a *auth.Auth, sessionID, model, userText string, maxMode bool) (string, error) {
 	// base64 模板解码 + 替换模型名
 	tplBytes, err := base64.StdEncoding.DecodeString(RemoteMsgTemplateB64)
 	if err != nil {
@@ -138,6 +184,9 @@ func (c *Client) RemoteSendMessage(a *auth.Auth, sessionID, model, userText stri
 	var body map[string]any
 	if err := json.Unmarshal([]byte(repl), &body); err != nil {
 		return "", fmt.Errorf("template parse: %w", err)
+	}
+	if maxMode {
+		body["model_selection_strategy"] = "max"
 	}
 	query, _ := json.Marshal([]map[string]any{{
 		"type": "text",
@@ -150,7 +199,7 @@ func (c *Client) RemoteSendMessage(a *auth.Auth, sessionID, model, userText stri
 		ui["query"] = []any{map[string]any{"type": "text", "data": map[string]any{"content": userText}}}
 	}
 	raw, _ := json.Marshal(body)
-	req, err := http.NewRequest(http.MethodPost, RemoteHost+fmt.Sprintf(RemoteEpMessages, sessionID), bytes.NewReader(raw))
+	req, err := http.NewRequest(http.MethodPost, remoteHostURL()+fmt.Sprintf(RemoteEpMessages, sessionID), bytes.NewReader(raw))
 	if err != nil {
 		return "", err
 	}
@@ -192,7 +241,7 @@ func (c *Client) RemoteWaitAndRead(ctx context.Context, a *auth.Auth, sessionID 
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		req, err := http.NewRequest(http.MethodGet,
-			RemoteHost+fmt.Sprintf(RemoteEpMessages, sessionID)+"?page_size=20", nil)
+			remoteHostURL()+fmt.Sprintf(RemoteEpMessages, sessionID)+"?page_size=20", nil)
 		if err != nil {
 			return "", err
 		}
@@ -243,7 +292,7 @@ func (c *Client) RemoteWaitAndRead(ctx context.Context, a *auth.Auth, sessionID 
 // RemoteDeleteSession 删除远程会话。任务完成或放弃后调用：
 // 每账号只有 2 个 solo 并发槽，不删除会话会占住槽位，导致后续消息 429。
 func (c *Client) RemoteDeleteSession(a *auth.Auth, sessionID string) error {
-	req, err := http.NewRequest(http.MethodDelete, RemoteHost+RemoteEpCreateSession+"/"+sessionID, nil)
+	req, err := http.NewRequest(http.MethodDelete, remoteHostURL()+RemoteEpCreateSession+"/"+sessionID, nil)
 	if err != nil {
 		return err
 	}
