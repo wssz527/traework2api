@@ -66,14 +66,31 @@ type RemoteEvent struct {
 
 // RemoteEventDelta 事件转换后的增量片段。
 // Content 与 Reasoning 二者至多一个有值（同一时刻只推一种）。
+// RemoteEventDeltaKind 事件增量类型（对齐 codex-proxy 判别联合思想：
+// 用类型字段而非靠字段推断，消除歧义）。
+type RemoteEventDeltaKind int
+
+const (
+	// DeltaContent 正文增量 → delta.content。
+	DeltaContent RemoteEventDeltaKind = iota
+	// DeltaReasoning 思考过程增量 → delta.reasoning_content。
+	DeltaReasoning
+	// DeltaToolCall 工具调用注记行 → delta.tool_calls（结构化，🔧）。
+	DeltaToolCall
+	// DeltaToolResult 工具结果回传行 → delta.content（✅ 结果帧）。
+	DeltaToolResult
+)
+
 type RemoteEventDelta struct {
-	// Content 正文增量 → delta.content。
+	// Kind 增量类型（判别字段）。
+	Kind RemoteEventDeltaKind
+	// Content 正文增量（Kind=DeltaContent）。
 	Content string
-	// Reasoning 思考过程增量 → delta.reasoning_content。
+	// Reasoning 思考过程增量（Kind=DeltaReasoning）。
 	Reasoning string
-	// ToolLine 工具调用注记行 → delta.tool_calls（结构化工具调用帧，🔧）。
+	// ToolLine 工具调用注记行（Kind=DeltaToolCall）。
 	ToolLine string
-	// ToolResult 工具结果回传行 → delta.content（✅ 结果帧，客户端显示为文本）。
+	// ToolResult 工具结果回传行（Kind=DeltaToolResult）。
 	ToolResult string
 }
 
@@ -351,11 +368,11 @@ func (s *remoteEventStream) mapPlanItem(raw []byte) []RemoteEventDelta {
 
 	// 思考过程：累积整值差分。
 	if inc := prefixDelta(prev.reasoning, pi.ReasoningContent); inc != "" {
-		out = append(out, RemoteEventDelta{Reasoning: inc})
+		out = append(out, RemoteEventDelta{Kind: DeltaReasoning, Reasoning: inc})
 	}
 	// 正文：累积整值差分。
 	if inc := prefixDelta(prev.thought, pi.Thought); inc != "" {
-		out = append(out, RemoteEventDelta{Content: inc})
+		out = append(out, RemoteEventDelta{Kind: DeltaContent, Content: inc})
 	}
 	s.seen[key] = seenItem{thought: pi.Thought, reasoning: pi.ReasoningContent}
 
@@ -366,7 +383,7 @@ func (s *remoteEventStream) mapPlanItem(raw []byte) []RemoteEventDelta {
 		if !s.emittedTools[tci.ID] {
 			if line := formatToolLine(tci); line != "" {
 				s.emittedTools[tci.ID] = true
-				out = append(out, RemoteEventDelta{ToolLine: line})
+				out = append(out, RemoteEventDelta{Kind: DeltaToolCall, ToolLine: line})
 			}
 		}
 		// 工具结果回传（对齐 codex-proxy 的 result 转发）：同一工具
@@ -375,7 +392,7 @@ func (s *remoteEventStream) mapPlanItem(raw []byte) []RemoteEventDelta {
 		if tci.Result != nil && len(tci.Result) > 2 && !s.emittedResults[tci.ID] {
 			if line := formatToolResult(tci); line != "" {
 				s.emittedResults[tci.ID] = true
-				out = append(out, RemoteEventDelta{ToolResult: line})
+				out = append(out, RemoteEventDelta{Kind: DeltaToolResult, ToolResult: line})
 			}
 		}
 	}

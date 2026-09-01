@@ -16,16 +16,28 @@ import (
 // 同一增量至多含一种正文：reasoning_content / content / 工具注记行。
 // 三者都为空时不写任何字节（调用方已过滤，这里再兜一层）。
 func writeRemoteDelta(w io.Writer, id string, created int64, model string, d upstream.RemoteEventDelta) {
-	switch {
-	case d.Reasoning != "":
+	switch d.Kind {
+	case upstream.DeltaReasoning:
+		if d.Reasoning == "" {
+			return
+		}
 		writeChunkWithReasoning(w, id, created, model, d.Reasoning)
-	case d.Content != "":
+	case upstream.DeltaContent:
+		if d.Content == "" {
+			return
+		}
 		writeChatChunk(w, id, created, model, "", d.Content, nil)
-	case d.ToolLine != "":
+	case upstream.DeltaToolCall:
+		if d.ToolLine == "" {
+			return
+		}
 		// 工具调用走 OpenAI 流式结构化字段 delta.tool_calls，
 		// 客户端正确显示为「工具调用」而非普通文本。
 		writeChunkWithToolCall(w, id, created, model, d.ToolLine)
-	case d.ToolResult != "":
+	case upstream.DeltaToolResult:
+		if d.ToolResult == "" {
+			return
+		}
 		// 工具结果回传走 content 文本（✅ 行），客户端显示为执行结果。
 		writeChatChunk(w, id, created, model, "", d.ToolResult, nil)
 	}

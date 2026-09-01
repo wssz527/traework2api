@@ -11,7 +11,7 @@ import (
 
 func TestWriteRemoteDeltaReasoning(t *testing.T) {
 	var sb strings.Builder
-	writeRemoteDelta(&sb, "id", 1, "m", upstream.RemoteEventDelta{Reasoning: "思考中"})
+	writeRemoteDelta(&sb, "id", 1, "m", upstream.RemoteEventDelta{Kind: upstream.DeltaReasoning, Reasoning: "思考中"})
 	got := sb.String()
 	if !strings.Contains(got, `"reasoning_content":"思考中"`) {
 		t.Fatalf("reasoning 应写入 delta.reasoning_content: %q", got)
@@ -26,7 +26,7 @@ func TestWriteRemoteDeltaReasoning(t *testing.T) {
 
 func TestWriteRemoteDeltaContent(t *testing.T) {
 	var sb strings.Builder
-	writeRemoteDelta(&sb, "id", 1, "m", upstream.RemoteEventDelta{Content: "正文"})
+	writeRemoteDelta(&sb, "id", 1, "m", upstream.RemoteEventDelta{Kind: upstream.DeltaContent, Content: "正文"})
 	if got := sb.String(); !strings.Contains(got, `"content":"正文"`) {
 		t.Fatalf("content 应写入 delta.content: %q", got)
 	}
@@ -34,7 +34,7 @@ func TestWriteRemoteDeltaContent(t *testing.T) {
 
 func TestWriteRemoteDeltaToolLine(t *testing.T) {
 	var sb strings.Builder
-	writeRemoteDelta(&sb, "id", 1, "m", upstream.RemoteEventDelta{ToolLine: "\n\n> 🔧 [本地工具] 本地工作区/read_file · {\"path\":\"/tmp/x\"}\n"})
+	writeRemoteDelta(&sb, "id", 1, "m", upstream.RemoteEventDelta{Kind: upstream.DeltaToolCall, ToolLine: "\n\n> 🔧 [本地工具] 本地工作区/read_file · {\"path\":\"/tmp/x\"}\n"})
 	got := sb.String()
 	// 工具调用应走结构化 delta.tool_calls（客户端正确显示为工具调用而非文本）
 	if !strings.Contains(got, "tool_calls") {
@@ -122,7 +122,7 @@ func TestToolKeyFromLine(t *testing.T) {
 
 func TestWriteRemoteDeltaToolResult(t *testing.T) {
 	var sb strings.Builder
-	writeRemoteDelta(&sb, "id", 1, "m", upstream.RemoteEventDelta{ToolResult: "\n\n> ✅ [read_file] 文件内容摘要\n"})
+	writeRemoteDelta(&sb, "id", 1, "m", upstream.RemoteEventDelta{Kind: upstream.DeltaToolResult, ToolResult: "\n\n> ✅ [read_file] 文件内容摘要\n"})
 	got := sb.String()
 	if !strings.Contains(got, "read_file") {
 		t.Fatalf("工具结果应写入 content: %q", got)
