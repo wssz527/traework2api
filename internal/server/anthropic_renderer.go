@@ -2,6 +2,15 @@
 // 把 remote 通道的增量（reasoning/content/tool_call/tool_result）渲染成
 // Anthropic SSE 事件（content_block start→delta→stop 成对）。
 // 对齐 codex-proxy 的 codex-to-anthropic.ts 翻译模式。
+//
+// tool_calls 闭环：本渲染器暂不实现 toolCallRenderer（tool_use block +
+// stop_reason=tool_use 终帧），保持旧行为 —— 桥 defer 模式下 tool_pending
+// 事件不渲染文本，等桥 120s 本地兜底后云端照常完成。原因：第二腿（工具
+// 结果回灌）需要从增量里检出 role:tool，而 Anthropic 协议的 tool_result
+// 是 user 消息里的 content block，messages.go 的 anthropicContentText 会
+// 把 content 拍平成纯文本（block 结构在进入 serveRemoteWith 前已丢失），
+// 闭环不通。只做第一腿反而有害：Claude Code 执行 tool_use 后结果无法
+// 回注云端，云端白等 120s。待 messages.go 保留 block 结构后再补。
 package server
 
 import (
@@ -154,7 +163,7 @@ func (r *anthropicRenderer) nonStream(w http.ResponseWriter, model, replyText st
 	id := fmt.Sprintf("msg_%d", created)
 	resp := map[string]any{
 		"id": id, "type": "message", "role": "assistant", "model": model,
-		"content": []map[string]any{{"type": "text", "text": replyText}},
+		"content":     []map[string]any{{"type": "text", "text": replyText}},
 		"stop_reason": "end_turn", "stop_sequence": nil,
 		"usage": map[string]any{"input_tokens": 0, "output_tokens": 0},
 	}

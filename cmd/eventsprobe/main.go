@@ -54,7 +54,13 @@ func main() {
 		if msg == "" {
 			msg = "先用一句话说你要做什么，然后调用你的本地 MCP 工具 read_file 读 /Users/wssz277/AgentProjects/trae-local-mcp/package.json 前 5 行，最后一句话总结"
 		}
-		mid, err := c.RemoteSendMessage(a, sid, "glm-5.3", msg, false)
+		model := os.Getenv("MODEL")
+		if model == "" {
+			model = "glm-5.3"
+		}
+		maxMode := os.Getenv("MAX") == "1"
+		fmt.Printf("[send] model=%s maxMode=%v\n", model, maxMode)
+		mid, err := c.RemoteSendMessage(a, sid, model, msg, maxMode)
 		if err != nil {
 			fmt.Println("FATAL: 发消息失败:", err)
 			os.Exit(1)

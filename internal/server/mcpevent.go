@@ -48,6 +48,11 @@ type McpEvent struct {
 	RemoteAddr    string `json:"remote_addr,omitempty"`
 	XForwardedFor string `json:"x_forwarded_for,omitempty"`
 
+	// PendingID defer 模式（桥 MCP_DEFER=1）下 tool_pending / tool_timeout_fallback
+	// 事件携带的挂起 ID：桥把经 ngrok 来的云端工具调用挂起为 pending 等客户端
+	// 原生执行，tw2api 以此 ID 与第二轮回传的 tool_call_id 配对。
+	PendingID string `json:"pending_id,omitempty"`
+
 	// 完整载荷（二期 P2）：单边 ≤4KB，超出由上报方截断并置 *Truncated。
 	ArgsFull        string `json:"args_full,omitempty"`
 	ArgsTruncated   bool   `json:"args_truncated,omitempty"`
