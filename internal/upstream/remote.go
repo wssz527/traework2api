@@ -255,11 +255,37 @@ func (c *Client) RemoteSendMessage(a *auth.Auth, sessionID, model, userText stri
 	return out.Data.MessageID, nil
 }
 
+// remotePollInterval 消息轮询间隔；remoteStallLimit 看门狗阈值（连续无
+// 进展轮询次数）。var 便于测试调短。
+//
+// 阈值从 20（~1min）放宽到 50（~2.5min）：带工具任务里云端 run_mcp 挂起
+// 等桥 120s 兜底执行期间消息数/状态/content 全部静止，1min 窗口必误杀；
+// 2.5min 覆盖兜底窗口并留恢复余量。真卡死（实测 session_066c213e 卡
+// 28min）在 2.5min 也能发现，总时限（15min）不变。
+var (
+	remotePollInterval = 3 * time.Second
+	remoteStallLimit   = 50
+)
+
 // RemoteWaitAndRead 轮询消息直到 completed，返回 assistant 回复文本。
 // timeout 为最大等待时长；ctx 取消（客户端断开）时立即返回 ctx.Err()。
-func (c *Client) RemoteWaitAndRead(ctx context.Context, a *auth.Auth, sessionID string, timeout time.Duration) (string, error) {
+//
+// 旧终稿防护（快照锚，可选变参 baseline）：复用会话的 append 轮里，消息
+// 列表存在上一轮的 assistant completed 旧终稿；不设锚会在首轮就把它当
+// 本轮回复立即返回（实测协议模式第二腿 0.2s 返回与第一腿相同的
+// tool_calls）。调用方在**发送增量之前**先拉一次列表取最大
+// message_index 作 baseline，之后只认 MessageIndex > baseline 的
+// assistant completed——发送时刻的旧消息恒 ≤ baseline、新回复恒 >
+// baseline，且不依赖「append 的 user 消息何时可见」（user 锚方案实测有
+// 入列延迟竞态）。baseline < 0（缺省）= 不设锚（新建会话/等待既有任务
+// 完成的路径：列表里没有更早轮次的 assistant completed 可误领）。
+func (c *Client) RemoteWaitAndRead(ctx context.Context, a *auth.Auth, sessionID string, timeout time.Duration, baseline ...int) (string, error) {
+	anchorIdx := -1
+	if len(baseline) > 0 {
+		anchorIdx = baseline[0]
+	}
 	deadline := time.Now().Add(timeout)
-	stalled := 0 // 连续无进展轮询次数（消息数/最新状态不变）
+	stalled := 0 // 连续无进展轮询次数（消息数/最新状态/最新内容长度不变）
 	var lastProg string
 	for time.Now().Before(deadline) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet,
@@ -283,52 +309,98 @@ func (c *Client) RemoteWaitAndRead(ctx context.Context, a *auth.Auth, sessionID 
 			Code int `json:"code"`
 			Data struct {
 				Items []struct {
-					Role    string `json:"role"`
-					Status  string `json:"status"`
-					Content string `json:"content"`
+					Role         string `json:"role"`
+					Status       string `json:"status"`
+					Content      string `json:"content"`
+					MessageIndex int    `json:"message_index"`
 				} `json:"items"`
 			} `json:"data"`
 		}
 		if err := json.Unmarshal(data, &out); err == nil {
-			// 找到最后一条 assistant 且 completed 的消息（按 message_index 取最新）
+			// 找到最后一条 assistant 且 completed 且在快照锚之后的消息。
 			var best *struct {
-				Role    string `json:"role"`
-				Status  string `json:"status"`
-				Content string `json:"content"`
+				Role         string `json:"role"`
+				Status       string `json:"status"`
+				Content      string `json:"content"`
+				MessageIndex int    `json:"message_index"`
 			}
 			for i := range out.Data.Items {
 				it := &out.Data.Items[i]
-				if it.Role == "assistant" && it.Status == "completed" && it.Content != "" {
+				if it.Role == "assistant" && it.Status == "completed" && it.Content != "" && it.MessageIndex > anchorIdx {
 					best = it
 				}
 			}
 			if best != nil {
 				return extractAssistantText(best.Content), nil
 			}
-			// 卡死检测：消息数 + 最新状态 连续 20 次无变化（约 1 分钟）→ 判定任务卡死，
-			// 提前放弃而非傻等 15 分钟（实测 session_066c213e 云端卡 28 分钟）。
-			prog := fmt.Sprintf("n=%d", len(out.Data.Items))
-			if len(out.Data.Items) > 0 {
-				last := out.Data.Items[len(out.Data.Items)-1]
-				prog = fmt.Sprintf("n=%d last=%s/%s", len(out.Data.Items), last.Role, last.Status)
-			}
-			if prog == lastProg {
-				stalled++
-				if stalled >= 20 {
-					return "", fmt.Errorf("%w: no progress after ~1min (%s)", ErrRemoteTimeout, prog)
-				}
-			} else {
-				lastProg = prog
+			// 卡死检测：消息数 + 最新状态 + 最新内容长度 连续 remoteStallLimit
+			// 次无变化 → 判定任务卡死，提前放弃而非傻等 15 分钟（实测
+			// session_066c213e 云端卡 28 分钟）。
+			// content 长度进签名：生成中的回复长度持续增长即视为活的（状态
+			// 在长生成期间恒为 running，不看长度会误杀正常长任务）。
+			// 消息数为 0（任务还在排队/慢启动，重任务实测可达 13 分钟）不算
+			// 卡死——只受总 timeout 约束，避免慢启动被误杀。
+			n := len(out.Data.Items)
+			if n == 0 {
 				stalled = 0
+			} else {
+				prog := fmt.Sprintf("n=%d", n)
+				last := out.Data.Items[n-1]
+				prog = fmt.Sprintf("n=%d last=%s/%s/%d", n, last.Role, last.Status, len(last.Content))
+				if prog == lastProg {
+					stalled++
+					if stalled >= remoteStallLimit {
+						return "", fmt.Errorf("%w: no progress after ~%s (%s)", ErrRemoteTimeout, time.Duration(remoteStallLimit)*remotePollInterval, prog)
+					}
+				} else {
+					lastProg = prog
+					stalled = 0
+				}
 			}
 		}
 		select {
 		case <-ctx.Done():
 			return "", ctx.Err()
-		case <-time.After(3 * time.Second):
+		case <-time.After(remotePollInterval):
 		}
 	}
 	return "", fmt.Errorf("%w after %s", ErrRemoteTimeout, timeout)
+}
+
+// RemoteMaxMessageIndex 拉一次消息列表，返回当前最大 message_index。
+// 供调用方在发送增量前取「快照锚」（见 RemoteWaitAndRead 的 baseline）。
+// 拉取失败返回 -1（调用方退化为不设锚，行为同旧版）。
+func (c *Client) RemoteMaxMessageIndex(ctx context.Context, a *auth.Auth, sessionID string) int {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		remoteHostURL()+fmt.Sprintf(RemoteEpMessages, sessionID)+"?page_size=5", nil)
+	if err != nil {
+		return -1
+	}
+	RemoteHeaders(req, a)
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return -1
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 5<<20))
+	var out struct {
+		Code int `json:"code"`
+		Data struct {
+			Items []struct {
+				MessageIndex int `json:"message_index"`
+			} `json:"items"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(data, &out); err != nil {
+		return -1
+	}
+	max := -1
+	for _, it := range out.Data.Items {
+		if it.MessageIndex > max {
+			max = it.MessageIndex
+		}
+	}
+	return max
 }
 
 // RemoteDeleteSession 删除远程会话。任务完成或放弃后调用：

@@ -175,6 +175,7 @@ func convReuseFakeUpstream(t *testing.T, mu *sync.Mutex, creates *int, sends map
 	t.Helper()
 	snapshotDynamicModelsCache(t) // 同上：隔离全局动态模型缓存
 	createsN := 0
+	getsN := 0 // GET /messages 次数：作为 message_index 递增（快照锚测试语义）
 	return &upstream.Client{
 		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 			mu.Lock()
@@ -209,10 +210,11 @@ func convReuseFakeUpstream(t *testing.T, mu *sync.Mutex, creates *int, sends map
 				lastText[sid] = text
 				return jsonHTTPResponse(200, `{"code":0,"data":{"message_id":"m1","accepted":true}}`), nil
 			case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/messages"):
+				getsN++
 				if pollFail {
-					return jsonHTTPResponse(200, `{"code":0,"data":{"items":[{"role":"user","status":"in_progress"}]}}`), nil
+					return jsonHTTPResponse(200, fmt.Sprintf(`{"code":0,"data":{"items":[{"role":"user","status":"in_progress","message_index":%d}]}}`, getsN)), nil
 				}
-				return jsonHTTPResponse(200, `{"code":0,"data":{"items":[{"role":"assistant","status":"completed","content":"云端回复A"}]}}`), nil
+				return jsonHTTPResponse(200, fmt.Sprintf(`{"code":0,"data":{"items":[{"role":"assistant","status":"completed","content":"云端回复A","message_index":%d}]}}`, getsN)), nil
 			case r.Method == http.MethodDelete:
 				return jsonHTTPResponse(200, `{"code":0,"message":"success"}`), nil
 			default:
@@ -716,10 +718,12 @@ func TestConvStoreReuseWithChangingSystem(t *testing.T) {
 	if e == nil || e.CloudSessionID != "cloud-1" {
 		t.Fatalf("system 变化后应命中原会话：e=%v", e)
 	}
-	// 第一轮链=[h(user)]，Bind 注册的键是 h(user)。第二轮命中 chain[0]（=h(user)），
-	// incFrom=1 → 增量从 assistant 回显开始，由 trimCloudEcho 剥离。
-	if incFrom != 1 {
-		t.Errorf("incFrom=%d want 1（命中 h(user)，增量从 assistant 起）", incFrom)
+	// 第一轮链=[h(user)]，Bind 注册的键是 h(user)。第二轮命中 chain[0]（=h(user)，
+	// 数组下标 1），incFrom 是数组坐标 = 2 → 增量 [assistant 回显, 新 user]，
+	// assistant 由 trimCloudEcho 剥离。（旧实现返回链坐标 1，增量会多含末尾
+	// user 消息重发——已修复，见 Lookup 注释。）
+	if incFrom != 2 {
+		t.Errorf("incFrom=%d want 2（命中 h(user)，增量从 assistant 起）", incFrom)
 	}
 }
 

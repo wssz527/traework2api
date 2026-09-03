@@ -56,6 +56,10 @@ type Handler struct {
 	// convs 会话连续性注册表（P1）。由 NewHandler 创建；nil = 禁用复用
 	//（每次新建会话，行为回退二期）。
 	convs *convStore
+	// pendings defer 模式下挂起中的本地工具调用注册表（tool_calls 闭环）。
+	// 由 NewHandler 创建；不经 NewHandler 构造的 Handler 不支持闭环
+	//（方法 receivers 做 nil 防御，行为回退为等桥 120s 兜底）。
+	pendings *pendingRegistry
 }
 
 // NewHandler 构建 handler。
@@ -85,6 +89,7 @@ func NewHandler(cfg Config) *Handler {
 		cfg: cfg, mux: http.NewServeMux(),
 		mcpEvents: newMcpEventBus(),
 		tasks:     newTaskRegistry(),
+		pendings:  newPendingRegistry(),
 	}
 	// P1 会话连续性：默认启用；TW2API_DISABLE_CONV_REUSE=1 或 ConvStorePath
 	// 为 "-" 时禁用（每次新建会话，回退二期行为）。
@@ -104,6 +109,10 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	// 本地 MCP 工具调用事件接收端点（事件总线在 NewHandler 时已建好）。
 	h.mux.HandleFunc("POST /internal/mcp-event", h.serveMcpEvent)
+	// 工具结果回注端点（tool_calls 闭环）：外部把客户端执行结果送回某个
+	// 挂起 pending 的渠道。与 mcp-event 同为内部端点，但载荷可影响闭环
+	// 状态，故套 withAuth（APIKey 为空时与 mcp-event 一样放行）。
+	h.mux.HandleFunc("POST /internal/inject-result", h.withAuth(h.serveInjectResult))
 	return h
 }
 
@@ -372,6 +381,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = json.Unmarshal(body, &peek)
 
+	// tool_calls 闭环探针（魔术标记门控）：验证客户端对
+	// delta.tool_calls + finish_reason=tool_calls 的真实执行行为。
+	// 不占账号池、不建云端会话；未命中标记的请求零影响。
+	if tryMockProbe(w, body, peek.Stream) {
+		return
+	}
+
 	configName, maxMode, err := h.mapModel(peek.Model)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
@@ -615,6 +631,7 @@ func writeOpenAIError(w http.ResponseWriter, status int, code, msg string) {
 //   - ErrNotFound → 404
 //   - ErrServer（5xx）→ 502
 //   - ErrClient（其他 4xx）→ 400
+//
 // upstreamErrorStatus 返回上游错误对应的 HTTP 状态码（流式错误帧用）。
 func upstreamErrorStatus(err error) (int, string) {
 	// sentinel 错误（remote 通道专用）
@@ -723,7 +740,7 @@ func messageText(content any) string {
 
 // remoteRenderer 把 remote 通道的增量与终态渲染成具体协议帧（OpenAI / Anthropic）。
 // 由 serveRemotePumpWith 在各写点调用；实现必须保证流式 content block 成对
-//（start→delta→stop），协议适配由各实现负责。
+// （start→delta→stop），协议适配由各实现负责。
 type remoteRenderer interface {
 	// streamStart 在 SSE 响应头发出后产生协议首帧。
 	streamStart(w io.Writer, id, model string, created int64)
@@ -737,6 +754,19 @@ type remoteRenderer interface {
 	streamFinish(w io.Writer, id, model string, created int64, replyText string)
 	// nonStream 渲染非流式完整响应。
 	nonStream(w http.ResponseWriter, model string, replyText string)
+}
+
+// toolCallRenderer 支持把挂起中的本地工具调用渲染成原生工具调用终帧的
+// 渲染器（tool_calls 闭环第一腿）。仅 openaiRenderer 实现；anthropicRenderer
+// 暂不实现 —— Anthropic 通道的第二腿（role:tool 检测）依赖 messages.go
+// 保留 tool_result block 结构，而当前 anthropicContentText 会把 content
+// 拍平成纯文本，闭环不通，故该通道保持旧行为（tool_pending 不推文本、
+// 等桥 120s 本地兜底后云端照常完成），见 anthropic_renderer.go 注释。
+type toolCallRenderer interface {
+	// toolCall 输出完整的原生工具调用帧序列并结束本轮：callID 直接使用
+	// 桥的 pendingID（客户端下一轮回传的 tool_call_id 即 pending_id，
+	// 回灌时无需查表即可配对）。argsJSON 是工具完整入参 JSON 字符串。
+	toolCall(w io.Writer, id, model string, created int64, callID, name, argsJSON string)
 }
 
 // openaiRenderer 把增量渲染成 OpenAI 流式 chunk / 完整响应。
@@ -775,6 +805,31 @@ func (openaiRenderer) streamFinish(w io.Writer, id, model string, created int64,
 func (openaiRenderer) nonStream(w http.ResponseWriter, model, replyText string) {
 	w.Header().Set("Content-Type", "application/json")
 	writeOpenAICompletion(w, model, replyText)
+}
+
+// toolCall 输出「原生 tool_calls + finish_reason=tool_calls」终帧序列
+// （tool_calls 闭环第一腿）。id/name/arguments 一次给全（不切片流式），
+// 已由 mockprobe 在 kimi-code 0.39.1 上实证：客户端收到后本地执行工具
+// 并在下一轮请求回传 role:"tool" 消息。
+func (openaiRenderer) toolCall(w io.Writer, id, model string, created int64, callID, name, argsJSON string) {
+	if argsJSON == "" {
+		argsJSON = "{}"
+	}
+	delta := map[string]any{
+		"tool_calls": []map[string]any{{
+			"index": 0, "id": callID, "type": "function",
+			"function": map[string]any{"name": name, "arguments": argsJSON},
+		}},
+	}
+	chunk := map[string]any{
+		"id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+		"choices": []map[string]any{{"index": 0, "delta": delta, "finish_reason": nil}},
+	}
+	raw, _ := json.Marshal(chunk)
+	fmt.Fprintf(w, "data: %s\n\n", raw)
+	// 终帧单独一帧给 finish_reason（OpenAI 官方流式形态），随后 [DONE]。
+	writeChatChunk(w, id, created, model, "", "", "tool_calls")
+	fmt.Fprint(w, "data: [DONE]\n\n")
 }
 
 // writeOpenAICompletion 渲染非流式 OpenAI chat.completion 响应体。
@@ -870,13 +925,27 @@ func (h *Handler) serveRemote(w http.ResponseWriter, r *http.Request, a *auth.Au
 
 // serveRemoteWith 执行 remote 通道完整往返（P1 起支持会话复用）：与
 // serveRemote 逻辑完全一致，仅把「增量/终态→协议帧」的渲染交给 render
-//（OpenAI 或 Anthropic）。复用会话注册表/账号池/串行化。
+// （OpenAI 或 Anthropic）。复用会话注册表/账号池/串行化。
 func (h *Handler) serveRemoteWith(w http.ResponseWriter, r *http.Request, a *auth.Auth, model string, body []byte, stream bool, maxMode bool, render remoteRenderer) error {
+	// 工具结果回灌（tool_calls 闭环第二腿）：上一轮以 tool_calls 终帧结束后，
+	// 客户端本地执行了工具并在本轮回传 role:tool。把结果回注桥解除云端挂起，
+	// 本轮不触云端（不建会话/不发消息/不轮询），直接短路回复。放在 convs
+	// 判空之前：legacy 路径同样支持回灌（按 tool_call_id 配对不依赖会话注册表）。
+	if h.tryInjectToolResultTurn(w, stream, model, maxMode, body) {
+		return nil
+	}
 	// P1 兼容：未启用会话注册表（DisableConvReuse 或字面量构造的 Handler）
 	// 时保持旧行为——每次新建、用完即删。
 	if h.convs == nil {
 		return h.serveRemoteLegacyWith(w, r, a, model, body, stream, maxMode, render)
 	}
+
+	// ---- 协议模式（伪 function calling）----
+	// 仅 OpenAI 渲染器支持（anthropicRenderer 无 tool_calls 渲染路径）。
+	// 回灌轮检测（tryInjectToolResultTurn）在协议模式下天然失效：pendings
+	// 注册表只由桥 defer 模式登记，永远为空，直接落到下面的复用路径。
+	_, isOpenAIRender := render.(openaiRenderer)
+	fcMode := isOpenAIRender && fcProtoEnabled(body)
 
 	msgs := bodyMessages(body)
 	chain := convPrefixChain(model, maxMode, msgs)
@@ -901,6 +970,11 @@ func (h *Handler) serveRemoteWith(w http.ResponseWriter, r *http.Request, a *aut
 					a = bound // 粘性：永远回创建它的账号
 					reuseID = e.CloudSessionID
 					appendText = formatIncrement(inc)
+					if fcMode {
+						// 协议模式增量：assistant.tool_calls → <tool_call> 块、
+						// role:tool → 结果文本，云端据此续答。
+						appendText = fcIncrement(inc)
+					}
 				}
 			}
 		}
@@ -923,10 +997,16 @@ func (h *Handler) serveRemoteWith(w http.ResponseWriter, r *http.Request, a *aut
 
 	// ---- 发送：复用增量 / 新建全量 ----
 	var sessID string
+	// 快照锚（旧终稿防护）：reuse 且有增量时，发送前取消息列表最大
+	// message_index，轮询只认其后的 assistant completed——否则上一轮旧终稿
+	// 会在首轮被立即认领（实测 0.2s 返回旧 tool_calls）。empty-append 与
+	// 新建路径不设锚（等的正是既有/首批消息）。
+	snapAnchor := -1
 	if reuseID != "" {
 		sessID = reuseID
 		log.Printf("remote: reuse session=%s model=%s uid=%s append=%dB", sessID, model, a.UID, len(appendText))
 		if appendText != "" {
+			snapAnchor = h.cfg.Upstream.RemoteMaxMessageIndex(r.Context(), a, sessID)
 			serr := h.sendRemoteWithBusyRetry(r, a, sessID, model, appendText, maxMode)
 			if serr != nil {
 				if errors.Is(serr, context.Canceled) {
@@ -935,6 +1015,7 @@ func (h *Handler) serveRemoteWith(w http.ResponseWriter, r *http.Request, a *aut
 				// 云端会话已不可用（4xx/5xx）：解绑并降级为新建全量历史。
 				h.convs.Unbind(sessID)
 				sessID = ""
+				snapAnchor = -1
 			}
 		} else {
 			// 增量剥离后为空：Lookup 已命中同一会话（reuseID 非空），说明这是
@@ -951,8 +1032,12 @@ func (h *Handler) serveRemoteWith(w http.ResponseWriter, r *http.Request, a *aut
 		if err != nil {
 			return err
 		}
-		log.Printf("remote: create session=%s model=%s uid=%s max=%v", sessID, model, a.UID, maxMode)
+		log.Printf("remote: create session=%s model=%s uid=%s max=%v fc=%v", sessID, model, a.UID, maxMode, fcMode)
 		userText := remotePrompt(body)
+		if fcMode {
+			// 协议模式全量：协议头（客户端 tools 注入）+ 全历史文本化。
+			userText = fcFullPrompt(body)
+		}
 		if serr := h.sendRemoteWithBusyRetry(r, a, sessID, model, userText, maxMode); serr != nil {
 			// 建了会话但消息没发出去：删会话释放并发槽，再交外层轮转。
 			_ = h.cfg.Upstream.RemoteDeleteSession(a, sessID)
@@ -974,26 +1059,56 @@ func (h *Handler) serveRemoteWith(w http.ResponseWriter, r *http.Request, a *aut
 
 	// 响应泵：流式事件订阅 + keepalive + 轮询终态裁决（二期逻辑原样）。
 	// 成功路径顺带把回复尾迹写回会话注册表（bindConv 的 replyTail 参数）。
+	// 协议模式下尾迹取「客户端将回显的形态」（协议块剥除后的正文），否则
+	// 尾迹含 <tool_call> 标记而客户端 content 是清洗文本，回显校验必然失败。
 	return h.serveRemotePumpWith(w, r, a, sessID, model, stream, func(reply string) {
-		h.bindConv(sessID, a.UID, terminalKey, len(msgs), replyTail(reply))
-	}, render)
+		tail := reply
+		if fcMode {
+			_, content := parseFCToolCalls(reply)
+			tail = content
+		}
+		h.bindConv(sessID, a.UID, terminalKey, len(msgs), replyTail(tail))
+	}, render, fcMode, snapAnchor)
 }
 
 // serveRemotePump 是 serveRemote 的 OpenAI 渲染入口（保持旧签名兼容测试）。
 func (h *Handler) serveRemotePump(w http.ResponseWriter, r *http.Request, a *auth.Auth, sessID, model string, stream bool, onReply func(string)) error {
-	return h.serveRemotePumpWith(w, r, a, sessID, model, stream, onReply, openaiRenderer{})
+	return h.serveRemotePumpWith(w, r, a, sessID, model, stream, onReply, openaiRenderer{}, false, -1)
 }
 
 // serveRemotePumpWith 二期的响应泵主体：流式首帧/MCP 事件订阅/云端事件流/
 // keepalive/轮询终态裁决。onReply 非 nil 时在成功拿到最终回复后回调一次
-//（P1 会话注册表刷新用）。增量与终态的协议帧由 render 渲染。
-func (h *Handler) serveRemotePumpWith(w http.ResponseWriter, r *http.Request, a *auth.Auth, sessID, model string, stream bool, onReply func(string), render remoteRenderer) error {
+// （P1 会话注册表刷新用）。增量与终态的协议帧由 render 渲染。
+// fcMode（可选变参，协议模式）与 snapAnchor（可选变参，快照锚，见
+// serveRemoteWith）语义见下。
+// fcMode（可选变参，协议模式）改变三处行为：
+//   - 云端正文增量不流推（<tool_call> 标记可能中途出现，终稿裁决后一次性
+//     渲染，避免协议文本污染客户端 content）；云端自己的工具调用注记行
+//     降级为普通文本（绝不渲染成结构化 tool_calls——那是桥的工具名，
+//     客户端不认识）
+//   - 桥 pending 打断禁用（协议模式下客户端只执行自己的工具；桥 120s
+//     兜底保证云端不卡死）
+//   - 终稿先过 parseFCToolCalls：有 <tool_call> 块 → 渲染原生
+//     tool_calls 终帧；无 → 纯文本收尾（不推 --- 分隔线）
+func (h *Handler) serveRemotePumpWith(w http.ResponseWriter, r *http.Request, a *auth.Auth, sessID, model string, stream bool, onReply func(string), render remoteRenderer, fcMode bool, snapAnchor int) error {
+	fc := fcMode
 
 	// 流式：先发头并周期发 SSE 注释心跳，防止客户端在分钟级轮询期间因空闲断连。
 	var mu sync.Mutex
 	var taskID string
 	var taskCreated int64
 	stopEventPump := func() {} // 非 stream 时空操作；stream 时替换为真正的收泵逻辑
+
+	// tool_pending 打断信号（pump → 主流程）：桥挂起了本地工具调用时，
+	// 本轮须以原生 tool_calls 终帧结束，不再等云端终态。主流程的轮询
+	// waitCtx 派生自请求 ctx，由 pump 在发信号的同时取消，使
+	// RemoteWaitAndRead 提前返回；pending 打断与客户端断开共用
+	// context.Canceled，靠 pendSig 里有没有事件区分两者。
+	pendSig := make(chan McpEvent, 1)
+	waitCtx, waitCancel := context.WithCancel(r.Context())
+	defer waitCancel()
+	tcr, canRenderToolCall := render.(toolCallRenderer)
+
 	if stream {
 		startRemoteStream(w)
 		// 首帧：交给 render（OpenAI=role assistant chunk；Anthropic=message_start
@@ -1048,10 +1163,37 @@ func (h *Handler) serveRemotePumpWith(w http.ResponseWriter, r *http.Request, a 
 					if !ok {
 						return
 					}
+					// tool_calls 闭环（桥 defer 模式）：tool_pending（或带
+					// PendingID 的 tool_call_start，桥早期设计兼容）→ 登记
+					// pending、通知主流程以原生 tool_calls 终帧结束本轮，
+					// 不推 🔧 文本（工具由客户端原生执行）。
+					// 协议模式禁用：桥工具名不属于客户端工具集，绝不外推。
+					if e.PendingID != "" && canRenderToolCall && !fc {
+						switch e.Event {
+						case "tool_pending", "tool_call_start":
+							h.pendings.register(e.PendingID, sessID, e.Tool)
+							select {
+							case pendSig <- e:
+							default:
+							}
+							waitCancel() // 打断 RemoteWaitAndRead，终帧由主流程写
+							return
+						case "tool_timeout_fallback":
+							// 桥侧 120s 兜底已本地执行：作废 pending（该事件
+							// 本身不渲染文本，云端会照常拿到兜底结果继续）。
+							h.pendings.drop(e.PendingID)
+							continue
+						}
+					}
 					// 去重（两路都可能先到，任一路输出后抑制另一路）：
 					// 本地事件是权威来源（带完整参数与结果），但若云端工具卡
 					// 已先输出同名工具，则本行跳过，避免同一调用刷两次。
 					if e.Event == "tool_call_start" && dedup.seen(e.Tool) {
+						continue
+					}
+					// 协议模式：本地 MCP 事件（🔧/✅ 过程注记）不推——云端
+					// 自跑工具的副产物对客户端是噪音（见 evCh 分支同款抑制）。
+					if fc {
 						continue
 					}
 					text := mcpEventDelta(e)
@@ -1068,6 +1210,18 @@ func (h *Handler) serveRemotePumpWith(w http.ResponseWriter, r *http.Request, a 
 						// 把 channel 置 nil 使其永久阻塞，pump 继续只处理 MCP 事件。
 						evCh = nil
 						continue
+					}
+					// 协议模式：云端正文增量不流推（协议标记防泄漏，终稿
+					// 裁决后一次性渲染）；沙盒过程注记（EnvironmentSetup/
+					// 工具卡/结果行）也不推——它们是云端自跑的副产物，
+					// 混进客户端 content 只会污染答案（实测终稿 content 前
+					// 挂着 "> 🔧 [沙盒] EnvironmentSetup" 块）。客户端只看
+					// reasoning + 终稿。
+					if fc {
+						switch d.Kind {
+						case upstream.DeltaContent, upstream.DeltaToolCall, upstream.DeltaToolResult:
+							continue
+						}
 					}
 					// 工具卡去重：本地 MCP 事件已先报过同名工具则跳过云端版本。
 					if d.ToolLine != "" && dedup.seen(d.ToolLine) {
@@ -1151,8 +1305,33 @@ func (h *Handler) serveRemotePumpWith(w http.ResponseWriter, r *http.Request, a 
 		defer close(done)
 	}
 
-	replyText, werr := h.cfg.Upstream.RemoteWaitAndRead(r.Context(), a, sessID, remoteWaitTotal)
+	replyText, werr := h.cfg.Upstream.RemoteWaitAndRead(waitCtx, a, sessID, remoteWaitTotal, snapAnchor)
 	if werr != nil {
+		// tool_pending 打断：桥把本地工具调用挂起等客户端执行，本轮以原生
+		// tool_calls 终帧结束。云端会话保留（下一轮客户端带工具结果回来时，
+		// 云端 run_mcp 已被回注解锁、继续生成，正常轮询拿终稿），绝不能
+		// 走下面的客户端断开分支删会话。
+		var pe McpEvent
+		select {
+		case pe = <-pendSig:
+		default:
+		}
+		if pe.PendingID != "" {
+			args := pe.ArgsFull
+			if args == "" {
+				args = pe.ArgsPreview
+			}
+			// 先停事件泵再写终帧（沿用 streamFinish 的顺序惯例），
+			// 防迟到事件穿插在 tool_calls 终帧之后。
+			stopEventPump()
+			mu.Lock()
+			tcr.toolCall(w, taskID, model, taskCreated, pe.PendingID, pe.Tool, args)
+			sseFlush(w)
+			mu.Unlock()
+			log.Printf("remote: pending tool_call %s (%s) ends stream, session=%s 保留等回灌",
+				pe.Tool, pe.PendingID, sessID)
+			return nil
+		}
 		if errors.Is(werr, context.Canceled) {
 			// 客户端已断开（点终止/关会话）：删云端会话停掉任务，释放
 			// 并发槽、停止烧积分，避免任务在云端空跑。
@@ -1183,6 +1362,48 @@ func (h *Handler) serveRemotePumpWith(w http.ResponseWriter, r *http.Request, a 
 	// 成功拿到回复：回调（P1 注册表刷新），再写响应。
 	if onReply != nil {
 		onReply(replyText)
+	}
+	// 协议模式终稿裁决：<tool_call> 块 → 原生 tool_calls 终帧（正文若有
+	// 先推）；纯文本 → 直接收尾（不推 --- 分隔线——协议模式没有过程正文
+	// 流，分隔线只会污染 content）。
+	if fc {
+		calls, content := parseFCToolCalls(replyText)
+		if len(calls) > 0 {
+			log.Printf("remote: fc proto %d tool_call(s) [%s] session=%s",
+				len(calls), calls[0].Name, sessID)
+			if stream {
+				stopEventPump()
+				mu.Lock()
+				if content != "" {
+					writeChatChunk(w, taskID, taskCreated, model, "", content, nil)
+				}
+				writeFCToolCallsFrame(w, taskID, model, taskCreated, calls, true)
+				sseFlush(w)
+				mu.Unlock()
+				return nil
+			}
+			mu.Lock()
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(fcNonStreamToolCallsJSON(model, content, calls)))
+			mu.Unlock()
+			return nil
+		}
+		if stream {
+			stopEventPump()
+			mu.Lock()
+			if content != "" {
+				writeChatChunk(w, taskID, taskCreated, model, "", content, nil)
+			}
+			writeChatChunk(w, taskID, taskCreated, model, "", "", "stop")
+			fmt.Fprint(w, "data: [DONE]\n\n")
+			sseFlush(w)
+			mu.Unlock()
+			return nil
+		}
+		mu.Lock()
+		render.nonStream(w, model, content)
+		mu.Unlock()
+		return nil
 	}
 	if stream {
 		// 终态裁决：先停事件泵（确保没有迟到工具事件穿插在终帧之后），

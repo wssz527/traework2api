@@ -119,16 +119,43 @@ func boolStr(b bool) string {
 // 请求 messages 的前缀链 prefix[0..n-1]；注册表里存的 key 是
 // prefix[consumed-1]（已消费前缀的终值）。从最长前缀往短找，第一个
 // 命中的注册项即最长匹配。
-// 返回 (entry, 增量起始下标增量消息从 messages[incFrom:] 起需要 append)。
-// incFrom = 命中项的 consumed；未命中时 incFrom = 0（全量重建）。
+// 返回 (entry, 增量起始的数组下标)：msgs[incFrom:] 起需要 append。
+// incFrom 是**消息数组坐标**（含 system），不是链坐标——链跳过 system，
+// 两个坐标在有 system 前缀时错位（链坐标会少算 system 条数，导致增量
+// 多包含末尾 user 消息重发一遍）。未命中时 incFrom = 0（全量重建）。
 func (s *convStore) Lookup(model string, maxMode bool, messages []map[string]any) (*convEntry, int) {
-	chain := convPrefixChain(model, maxMode, messages)
+	h := sha256.Sum256([]byte("tw2api-conv-v1|" + model + "|max=" + boolStr(maxMode)))
+	type node struct {
+		key    string // 链终值（前缀哈希）
+		arrIdx int    // 该链项对应的 messages 数组下标
+	}
+	nodes := make([]node, 0, len(messages))
+	for i, msg := range messages {
+		role, _ := msg["role"].(string)
+		// system 消息是会话无关的元数据（工具列表/token 计数/时间戳每轮都变），
+		// 参与链哈希会导致同一会话的连续轮次链首项不同、Lookup 永远 miss、
+		// 每轮新建云端会话。跳过 system，只对 user/assistant 对话建链。
+		if role == "system" {
+			continue
+		}
+		// user 消息先剥 system-reminder 再哈希（codex-proxy 稳定会话键机制）：
+		// system-reminder 出现在 user 消息里（中断恢复/插件通知）时不污染链。
+		if role == "user" {
+			if text, ok := msg["content"].(string); ok {
+				msg = map[string]any{"role": role, "content": normalizeConvAnchor(text)}
+			}
+		}
+		raw, _ := json.Marshal(msg)
+		sum := sha256.Sum256(append(h[:], raw...))
+		nodes = append(nodes, node{key: hex.EncodeToString(sum[:]), arrIdx: i})
+		h = sum
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	// 从最长前缀开始匹配（最长优先：多次 append 后链更深）。
-	for i := len(chain) - 1; i >= 0; i-- {
-		if e, ok := s.m[chain[i]]; ok {
-			return e, i + 1
+	for j := len(nodes) - 1; j >= 0; j-- {
+		if e, ok := s.m[nodes[j].key]; ok {
+			return e, nodes[j].arrIdx + 1
 		}
 	}
 	return nil, 0
