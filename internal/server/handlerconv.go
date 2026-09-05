@@ -97,7 +97,7 @@ func (h *Handler) serveRemoteLegacyWith(w http.ResponseWriter, r *http.Request, 
 	if err := h.sendRemoteWithBusyRetry(r, a, sessID, model, userText, maxMode); err != nil {
 		return err
 	}
-	return h.serveRemotePumpWith(w, r, a, sessID, model, stream, nil, render, false, -1)
+	return h.serveRemotePumpWith(w, r, a, sessID, model, stream, nil, render, false, -1, nil)
 }
 
 // ---------------------------------------------------------------------------

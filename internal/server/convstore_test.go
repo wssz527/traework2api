@@ -516,12 +516,15 @@ func TestConvSweeperDeletesExpired(t *testing.T) {
 	defer restore()
 	t.Setenv("TW2API_CONV_TTL", "50ms")
 	// convTTLDur 是即时读取的，Sweep 参数在 StartConvSweeper 内取。
-	var deletes int
+	var deletesMu sync.Mutex
+	deletes := 0
 	up := convReuseFakeUpstream(t, &sync.Mutex{}, new(int), map[string]int{}, map[string]string{}, false)
 	base := up.HTTP.Transport
 	up.HTTP.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if r.Method == http.MethodDelete {
+			deletesMu.Lock()
 			deletes++
+			deletesMu.Unlock()
 		}
 		return base.RoundTrip(r)
 	})
@@ -543,14 +546,24 @@ func TestConvSweeperDeletesExpired(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	h.StartConvSweeper(ctx)
+	deleted := func() int {
+		deletesMu.Lock()
+		defer deletesMu.Unlock()
+		return deletes
+	}
+	remaining := func() int {
+		h.convs.mu.Lock()
+		defer h.convs.mu.Unlock()
+		return len(h.convs.m)
+	}
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
-		if deletes >= 1 && len(h.convs.m) == 0 {
+		if deleted() >= 1 && remaining() == 0 {
 			return // 清扫成功
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	t.Fatalf("清扫器未回收会话：deletes=%d remaining=%d", deletes, len(h.convs.m))
+	t.Fatalf("清扫器未回收会话：deletes=%d remaining=%d", deleted(), remaining())
 }
 
 // TestConvReuseDisabledKeepsLegacy Env/Config 关闭复用 → 保持「用完即删」旧行为。

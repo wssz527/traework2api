@@ -1058,39 +1058,46 @@ func (h *Handler) serveRemoteWith(w http.ResponseWriter, r *http.Request, a *aut
 	}
 
 	// 响应泵：流式事件订阅 + keepalive + 轮询终态裁决（二期逻辑原样）。
-	// 成功路径顺带把回复尾迹写回会话注册表（bindConv 的 replyTail 参数）。
-	// 协议模式下尾迹取「客户端将回显的形态」（协议块剥除后的正文），否则
-	// 尾迹含 <tool_call> 标记而客户端 content 是清洗文本，回显校验必然失败。
-	return h.serveRemotePumpWith(w, r, a, sessID, model, stream, func(reply string) {
+	// 成功路径顺带把回复尾迹写回会话注册表（onReply 的 effSessID 参数：
+	// 自跑重试命中新会话时绑定随之切换）。协议模式下尾迹取「客户端将
+	// 回显的形态」（协议块剥除后的正文），否则尾迹含 <tool_call> 标记而
+	// 客户端 content 是清洗文本，回显校验必然失败。
+	var fcRetry *fcRetryAttempt
+	if fcMode {
+		fcRetry = &fcRetryAttempt{text: fcFullPrompt(body), maxMode: maxMode}
+	}
+	return h.serveRemotePumpWith(w, r, a, sessID, model, stream, func(effSessID, reply string) {
 		tail := reply
 		if fcMode {
 			_, content := parseFCToolCalls(reply)
 			tail = content
 		}
-		h.bindConv(sessID, a.UID, terminalKey, len(msgs), replyTail(tail))
-	}, render, fcMode, snapAnchor)
+		h.bindConv(effSessID, a.UID, terminalKey, len(msgs), replyTail(tail))
+	}, render, fcMode, snapAnchor, fcRetry)
 }
 
 // serveRemotePump 是 serveRemote 的 OpenAI 渲染入口（保持旧签名兼容测试）。
 func (h *Handler) serveRemotePump(w http.ResponseWriter, r *http.Request, a *auth.Auth, sessID, model string, stream bool, onReply func(string)) error {
-	return h.serveRemotePumpWith(w, r, a, sessID, model, stream, onReply, openaiRenderer{}, false, -1)
+	return h.serveRemotePumpWith(w, r, a, sessID, model, stream,
+		func(effSessID, reply string) { onReply(reply) },
+		openaiRenderer{}, false, -1, nil)
 }
 
 // serveRemotePumpWith 二期的响应泵主体：流式首帧/MCP 事件订阅/云端事件流/
 // keepalive/轮询终态裁决。onReply 非 nil 时在成功拿到最终回复后回调一次
-// （P1 会话注册表刷新用）。增量与终态的协议帧由 render 渲染。
-// fcMode（可选变参，协议模式）与 snapAnchor（可选变参，快照锚，见
-// serveRemoteWith）语义见下。
-// fcMode（可选变参，协议模式）改变三处行为：
-//   - 云端正文增量不流推（<tool_call> 标记可能中途出现，终稿裁决后一次性
-//     渲染，避免协议文本污染客户端 content）；云端自己的工具调用注记行
-//     降级为普通文本（绝不渲染成结构化 tool_calls——那是桥的工具名，
-//     客户端不认识）
+// （P1 会话注册表刷新用；effSessID=实际产出回复的云端会话，重试后与
+// sessID 不同）。增量与终态的协议帧由 render 渲染。
+// fcMode=true（协议模式）改变三处行为：
+//   - 云端正文/注记增量不流推（<tool_call> 标记与沙盒过程行防泄漏，
+//     终稿裁决后一次性渲染）
 //   - 桥 pending 打断禁用（协议模式下客户端只执行自己的工具；桥 120s
 //     兜底保证云端不卡死）
 //   - 终稿先过 parseFCToolCalls：有 <tool_call> 块 → 渲染原生
-//     tool_calls 终帧；无 → 纯文本收尾（不推 --- 分隔线）
-func (h *Handler) serveRemotePumpWith(w http.ResponseWriter, r *http.Request, a *auth.Auth, sessID, model string, stream bool, onReply func(string), render remoteRenderer, fcMode bool, snapAnchor int) error {
+//     tool_calls 终帧；无 → 纯文本收尾（不推 --- 分隔线）。
+//     若无块且检测到云端自跑沙盒工具（fcSelfRan）且 fcRetry 非 nil 且
+//     未被 env 关闭 → 新会话重发协议全量文本一次（旧会话删除释放并发
+//     槽），以重试结果渲染本轮
+func (h *Handler) serveRemotePumpWith(w http.ResponseWriter, r *http.Request, a *auth.Auth, sessID, model string, stream bool, onReply func(effSessID, reply string), render remoteRenderer, fcMode bool, snapAnchor int, fcRetry *fcRetryAttempt) error {
 	fc := fcMode
 
 	// 流式：先发头并周期发 SSE 注释心跳，防止客户端在分钟级轮询期间因空闲断连。
@@ -1359,18 +1366,45 @@ func (h *Handler) serveRemotePumpWith(w http.ResponseWriter, r *http.Request, a 
 		mu.Unlock()
 		return nil
 	}
-	// 成功拿到回复：回调（P1 注册表刷新），再写响应。
-	if onReply != nil {
-		onReply(replyText)
-	}
-	// 协议模式终稿裁决：<tool_call> 块 → 原生 tool_calls 终帧（正文若有
-	// 先推）；纯文本 → 直接收尾（不推 --- 分隔线——协议模式没有过程正文
-	// 流，分隔线只会污染 content）。
+	// 成功拿到回复：协议模式先做终稿裁决（含自跑重试），再回调写响应。
+	effSess := sessID
 	if fc {
 		calls, content := parseFCToolCalls(replyText)
+		content = fcCleanContent(content)
+		// 云端自跑沙盒工具兜底：无协议调用且检测到自跑注记 → 新会话重发
+		// 协议全量文本一次。自跑答案来自沙盒文件系统（非用户机器），静默
+		// 返回是错的；重试代价一次会话+轮询，换取正确性。
+		if len(calls) == 0 && fcRetry != nil && !fcRetryDisabled() && fcSelfRan(replyText) {
+			log.Printf("remote: fc self-run detected session=%s → one retry", sessID)
+			if s2, err := h.cfg.Upstream.RemoteCreateSession(a); err == nil {
+				if serr := h.sendRemoteWithBusyRetry(r, a, s2, model, fcRetry.text, fcRetry.maxMode); serr == nil {
+					if reply2, err2 := h.cfg.Upstream.RemoteWaitAndRead(waitCtx, a, s2, remoteWaitTotal, -1); err2 == nil {
+						c2, ct2 := parseFCToolCalls(reply2)
+						replyText, calls, content = reply2, c2, fcCleanContent(ct2)
+						effSess = s2
+						// 旧会话已污染且占用并发槽（每账号仅 2 个）：删除。
+						if dErr := h.cfg.Upstream.RemoteDeleteSession(a, sessID); dErr != nil {
+							log.Printf("remote: fc retry delete old session %s: %v", sessID, dErr)
+						}
+						log.Printf("remote: fc retry ok session=%s → %s", sessID, s2)
+					} else {
+						_ = h.cfg.Upstream.RemoteDeleteSession(a, s2)
+						log.Printf("remote: fc retry poll failed: %v", err2)
+					}
+				} else {
+					_ = h.cfg.Upstream.RemoteDeleteSession(a, s2)
+					log.Printf("remote: fc retry send failed: %v", serr)
+				}
+			} else {
+				log.Printf("remote: fc retry create failed: %v", err)
+			}
+		}
+		if onReply != nil {
+			onReply(effSess, replyText)
+		}
 		if len(calls) > 0 {
 			log.Printf("remote: fc proto %d tool_call(s) [%s] session=%s",
-				len(calls), calls[0].Name, sessID)
+				len(calls), calls[0].Name, effSess)
 			if stream {
 				stopEventPump()
 				mu.Lock()
@@ -1404,6 +1438,10 @@ func (h *Handler) serveRemotePumpWith(w http.ResponseWriter, r *http.Request, a 
 		render.nonStream(w, model, content)
 		mu.Unlock()
 		return nil
+	}
+	// 非协议模式：回调（P1 注册表刷新），再写响应。
+	if onReply != nil {
+		onReply(sessID, replyText)
 	}
 	if stream {
 		// 终态裁决：先停事件泵（确保没有迟到工具事件穿插在终帧之后），

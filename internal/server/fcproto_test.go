@@ -4,6 +4,7 @@ package server
 import (
 	"encoding/json"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -230,5 +231,81 @@ func TestParseFCToolCallsDSML(t *testing.T) {
 	calls2, _ := parseFCToolCalls(`prefix <|DSML|tool_call>{"name":"Bash","arguments":{"command":"ls"}}`)
 	if len(calls2) != 1 || calls2[0].Name != "Bash" {
 		t.Fatalf("DSML 半角未闭合应兜底解析: %+v", calls2)
+	}
+}
+
+// 并发安全：fcCallID 计数器（-race 下验证）
+func TestFCCallIDConcurrent(t *testing.T) {
+	var wg sync.WaitGroup
+	seen := sync.Map{}
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 50; j++ {
+				id := fcCallID(0)
+				if _, loaded := seen.LoadOrStore(id, true); loaded {
+					t.Errorf("重复 id: %s", id)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+// 解析失败兜底：坏块调用丢弃但原文保留在正文（宁可见噪声不可静默丢内容）
+func TestParseFCToolCallsMalformedKeepsRaw(t *testing.T) {
+	calls, content := parseFCToolCalls("<tool_call>{broken json</tool_call>rest of text")
+	if len(calls) != 0 {
+		t.Errorf("坏块不应产生调用: %+v", calls)
+	}
+	if !strings.Contains(content, "{broken json") || !strings.Contains(content, "rest of text") {
+		t.Errorf("坏块原文应保留在正文: %q", content)
+	}
+}
+
+// tool_choice=none：客户端显式禁用工具 → 不注入协议头
+func TestFCProtoDisabledOnToolChoiceNone(t *testing.T) {
+	body := []byte(`{"model":"m","stream":true,"tool_choice":"none","tools":[{"type":"function","function":{"name":"Bash"}}],"messages":[{"role":"user","content":"hi"}]}`)
+	if fcProtoEnabled(body) {
+		t.Fatal("tool_choice=none 应禁用协议模式")
+	}
+	body2 := []byte(`{"model":"m","stream":true,"tool_choice":"auto","tools":[{"type":"function","function":{"name":"Bash"}}],"messages":[{"role":"user","content":"hi"}]}`)
+	if !fcProtoEnabled(body2) {
+		t.Fatal("tool_choice=auto 应保持协议模式")
+	}
+	body3 := []byte(`{"model":"m","stream":true,"tool_choice":{"type":"function","function":{"name":"Bash"}},"tools":[{"type":"function","function":{"name":"Bash"}}],"messages":[{"role":"user","content":"hi"}]}`)
+	if !fcProtoEnabled(body3) {
+		t.Fatal("tool_choice 具名函数应保持协议模式")
+	}
+}
+
+// 自跑检测：EnvironmentSetup（会话初始化固定动作）不算自跑；其他沙盒/
+// 桥工具算
+func TestFCSelfRan(t *testing.T) {
+	setupOnly := "\n\n> 🔧 [沙盒] EnvironmentSetup\n\n\n> ✅ [EnvironmentSetup] MCP Servers: ✓ (14 tools)\n9"
+	if fcSelfRan(setupOnly) {
+		t.Error("仅 EnvironmentSetup 不应判自跑")
+	}
+	selfRun := "\n> 🔧 [沙盒] EnvironmentSetup\n> 🔧 [沙盒] Read\n8"
+	if !fcSelfRan(selfRun) {
+		t.Error("沙盒 Read 自跑应被检测")
+	}
+	if fcSelfRan("plain answer, no tools") {
+		t.Error("纯文本不应判自跑")
+	}
+	if !fcSelfRan("> 🔧 [本地工具] mcp/list_dir · ...") {
+		t.Error("桥本地工具自跑应被检测")
+	}
+}
+
+// 注记清洗：终稿里的 🔧/✅ 行剥除，正文保留
+func TestFCCleanContent(t *testing.T) {
+	in := "\n\n> 🔧 [沙盒] EnvironmentSetup\n\n\n> ✅ [EnvironmentSetup] MCP Servers: ✓\n\nanswer body\n"
+	if got := fcCleanContent(in); got != "answer body" {
+		t.Errorf("got %q want %q", got, "answer body")
+	}
+	if got := fcCleanContent("no annotations"); got != "no annotations" {
+		t.Errorf("无注记应原样: %q", got)
 	}
 }

@@ -25,6 +25,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -38,13 +39,20 @@ var fcProtoDisabled = func() bool {
 	return false
 }()
 
-// fcProtoEnabled 判定请求是否走协议模式：body 携带非空 tools 且未被
-// env 关闭。
+// fcProtoEnabled 判定请求是否走协议模式：body 携带非空 tools、未被 env
+// 关闭、且 tool_choice != "none"（客户端显式禁用工具时不注入协议头，
+// 保持纯代理行为——否则模型会被协议头引导着输出无人执行的 tool_call）。
 func fcProtoEnabled(body []byte) bool {
 	if fcProtoDisabled {
 		return false
 	}
-	tools, _ := bodyUnmarshal(body)["tools"].([]any)
+	m := bodyUnmarshal(body)
+	if tc, ok := m["tool_choice"]; ok {
+		if s, ok := tc.(string); ok && s == "none" {
+			return false
+		}
+	}
+	tools, _ := m["tools"].([]any)
 	return len(tools) > 0
 }
 
@@ -224,11 +232,11 @@ type fcCall struct {
 }
 
 // fcCallID 生成客户端可回传配对的调用 id（call_ 前缀，OpenAI 惯例）。
-var fcCallSeq int64
+// atomic：并发流式请求共用此计数器（测试 -race 实证全局 int++ 会竞态）。
+var fcCallSeq atomic.Int64
 
 func fcCallID(i int) string {
-	fcCallSeq++
-	return fmt.Sprintf("call_fc%d_%d", fcCallSeq, i)
+	return fmt.Sprintf("call_fc%d_%d", fcCallSeq.Add(1), i)
 }
 
 // fcDSMLTag 可选的 DeepSeek 原生 DSML 包装前缀（全角/半角竖线两种形态）。
@@ -246,8 +254,8 @@ var fcToolCallRe = regexp.MustCompile(
 
 // parseFCToolCalls 从云端终稿解析全部 <tool_call> 块，返回调用列表与
 // 去块后的正文（作为 assistant content；无调用时正文原样返回）。
-// 单块 JSON 非法时宽松兜底：正则抓 "name" 与 "arguments" 原文；再不行
-// 跳过该块（宁缺勿错——客户端拿到未知工具名会直接报错）。
+// 单块 JSON 非法时保守降级：调用被丢弃，但块原文保留在正文里（客户端
+// 用户能看到模型原话，而不是静默吞掉一段输出——宁可见到噪声不可丢内容）。
 func parseFCToolCalls(text string) ([]fcCall, string) {
 	matches := fcToolCallRe.FindAllStringSubmatchIndex(text, -1)
 	if len(matches) == 0 {
@@ -256,12 +264,15 @@ func parseFCToolCalls(text string) ([]fcCall, string) {
 	var calls []fcCall
 	var clean strings.Builder
 	last := 0
-	for _, loc := range matches {
+	for idx, loc := range matches {
 		clean.WriteString(text[last:loc[0]])
 		last = loc[1]
 		body := strings.TrimSpace(text[loc[2]:loc[3]])
 		if c, ok := parseFCCallJSON(body); ok {
 			calls = append(calls, c)
+		} else {
+			// 解析失败：原文回填正文（附标记），调用丢弃。
+			fmt.Fprintf(&clean, "[unparsed tool_call #%d: %s]", idx+1, body)
 		}
 	}
 	clean.WriteString(text[last:])
@@ -354,4 +365,50 @@ func fcNonStreamToolCallsJSON(model, content string, calls []fcCall) string {
 	}
 	raw, _ := json.Marshal(resp)
 	return string(raw)
+}
+
+// ---------------------------------------------------------------------------
+// 云端自跑检测与清洗（协议失败形态的工程兜底）
+// ---------------------------------------------------------------------------
+
+// fcAnnotLineRe 云端沙盒/桥工具注记行（"🔧 [沙盒] Read"、"✅ [EnvironmentSetup]
+// MCP ..."）。即使增量已流抑制，轮询终稿里仍可能混入——fc 模式输出前清洗。
+var fcAnnotLineRe = regexp.MustCompile(`(?m)^[^\S\n]*>?[^\S\n]*[🔧✅❌]\s*\[[^\]]*\][^\n]*\n?`)
+
+// fcCleanContent 剥除注记行并修剪空白。
+func fcCleanContent(s string) string {
+	return strings.TrimSpace(fcAnnotLineRe.ReplaceAllString(s, ""))
+}
+
+// fcToolAnnotRe 工具调用注记（🔧 行）里的工具名。
+var fcToolAnnotRe = regexp.MustCompile(`🔧\s*\[(?:沙盒|本地工具)\]\s*(\S+)`)
+
+// fcSelfRan 判定云端是否自跑了沙盒/桥工具（协议失败形态：模型无视协议
+// 头直接用 IDE 工具自答，答案来自沙盒文件系统而非用户机器，对客户端是
+// 错的）。EnvironmentSetup 是云端会话初始化的固定动作、每个新会话都有，
+// 不算自跑。
+func fcSelfRan(reply string) bool {
+	for _, m := range fcToolAnnotRe.FindAllStringSubmatch(reply, -1) {
+		if strings.TrimSpace(m[1]) != "EnvironmentSetup" {
+			return true
+		}
+	}
+	return false
+}
+
+// fcRetryDisabled env TW2API_DISABLE_FC_RETRY=1 关闭自跑自动重试。即时
+// 读取（非包级缓存），测试可 Setenv 翻转。
+func fcRetryDisabled() bool {
+	switch strings.TrimSpace(os.Getenv("TW2API_DISABLE_FC_RETRY")) {
+	case "1", "true", "TRUE", "True", "yes", "on":
+		return true
+	}
+	return false
+}
+
+// fcRetryAttempt 重试载荷：serveRemoteWith 构造（协议全量文本 + 模型模式），
+// pump 在检测到自跑且本轮未重试过时用于一次性重试。
+type fcRetryAttempt struct {
+	text    string // fcFullPrompt(body) 重发文本
+	maxMode bool
 }
