@@ -2,16 +2,15 @@
 //
 // 目标：上游 / TRAE 客户端发新版时插件自己跟上，不需要手动改 constants.go。
 //
-// 三级回退（按需求实现，但带"只进不退"保护）：
-//  1. 公开网页源：抓 TRAE 官方更新日志页解析最新桌面端版本
+// 版本源优先级（带"只进不退"保护）：
+//  1. check_update API（主源）：官方公开无鉴权实时接口，返回 data.appVersion
+//     （实测与客户端同步，官方 changelog 落后约 6 个补丁级，已弃用）
 //  2. 本机客户端探测：/Applications/TRAE SOLO CN.app 的 CFBundleShortVersionString
-//  3. constants.go 内置常量（最终回退）
+//     （本地客户端存在时作为交叉校验；已卸载客户端则可选忽略）
+//  3. constants.go 内置常量（最终回退 / 下限）
 //
-// 为什么不是"网页优先、取到就用"：实测（2026-09-08）两个网页源都停留在
-// 0.1.49-52（2026-08-21），而内置常量与本机客户端都是 0.1.63。若网页优先
-// 且取到就用，插件会把版本从 0.1.63 降到 0.1.49 —— 这是回退而不是跟踪，
-// 上游可能据此拒绝请求或改变行为。因此这里把内置常量作为**下限**：
-// 取所有可用来源中的最大值，跟踪只会向前。
+// 只进不退：内置常量作为**下限**，任何来源返回的版本低于内置值时忽略，
+// 取所有可用来源中的最大值，跟踪只会向前，绝不降级。
 //
 // 失败静默回退，绝不阻塞请求链路：读取走缓存（无缓存时用内置常量），
 // 刷新在后台 goroutine 里做，成功缓存 24h / 失败负缓存 1h。
@@ -19,6 +18,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -40,18 +40,31 @@ const (
 	versionFetchTO    = 20 * time.Second
 )
 
-// 网页源候选（两个都试，取解析成功的结果）。
-// 声明为 var 而非 const：测试可指向 httptest，避免单测依赖真实外网。
-var (
-	srcChangelog     = "https://www.trae.cn/changelog"
-	srcWorkChangelog = "https://docs.trae.cn/work_changelog"
-)
+// checkUpdateAPI 是官方版本实时接口（主源）。声明为 var 而非 const：
+// 测试可指向 httptest，避免单测依赖真实外网。
+var checkUpdateAPI = "https://api.trae.com.cn/icube/api/v1/package/check_update"
 
 // 本机客户端候选路径（可能未安装 / 已卸载）。
 var localClientPaths = []string{
 	"/Applications/TRAE SOLO CN.app/Contents/Info.plist",
 	"/Applications/TRAE CN.app/Contents/Info.plist",
 }
+
+// checkUpdateParams 是 check_update 请求的固定参数子集（实测最小可返回正常结果）。
+// mid 只需非空；uid/did/buildId 等客户端专用参数均可省略。
+var checkUpdateParams = []string{
+	"branch=release_solo_cn",
+	"packageType=stable_cn",
+	"productCode=SOLO_Lite",
+	"platform=Mac",
+	"arch=arm64",
+	"userRegion=CN",
+	"tenant=marscode",
+}
+
+// IdeBuildVersion 是内置的 tronBuildVersion（与 IdeVersion 配套；见
+// trae-version-source.md 实测 2.3.81345）。check_update 用它作为当前已知值。
+const IdeBuildVersion = "2.3.81345"
 
 // upstreamVersion 一对版本标识。
 type upstreamVersion struct {
@@ -165,12 +178,13 @@ func probeAndStoreVersion() {
 }
 
 // ---------------------------------------------------------------------------
-// 三级探测
+// 版本源探测
 // ---------------------------------------------------------------------------
 
-// webSourceURLs 返回当前网页源列表（每次读取，便于测试覆盖）。
-func webSourceURLs() []string {
-	return []string{srcChangelog, srcWorkChangelog}
+// versionSources 返回当前版本源列表（按优先级，管理接口展示用）。
+// 每次读取，便于测试覆盖。
+func versionSources() []string {
+	return []string{"api:" + checkUpdateAPI, "local:" + localClientPaths[0]}
 }
 
 // probeUpstreamVersion 依次尝试各来源，返回其中版本最大的一个。
@@ -180,28 +194,15 @@ func probeUpstreamVersion() (upstreamVersion, string, error) {
 	var bestSrc string
 	var firstErr error
 
-	// 1) 公开网页源
-	for _, u := range webSourceURLs() {
-		body, err := fetchVersionPage(u)
-		if err != nil {
-			if firstErr == nil {
-				firstErr = fmt.Errorf("%s: %w", u, err)
-			}
-			continue
-		}
-		v, perr := parseVersionPage(u, body)
-		if perr != nil {
-			if firstErr == nil {
-				firstErr = fmt.Errorf("%s: %w", u, perr)
-			}
-			continue
-		}
-		if compareVersions(v.IdeVersion, best.IdeVersion) > 0 {
-			best, bestSrc = v, u
-		}
+	// 1) check_update API（主源，官方实时）
+	v, src, err := probeCheckUpdateAPI()
+	if err != nil {
+		firstErr = fmt.Errorf("check_update: %w", err)
+	} else {
+		best, bestSrc = v, src
 	}
 
-	// 2) 本机客户端探测
+	// 2) 本机客户端探测（交叉校验；客户端已卸载时可省略）
 	for _, p := range localClientPaths {
 		v, err := probeLocalClient(p)
 		if err != nil {
@@ -224,123 +225,81 @@ func probeUpstreamVersion() (upstreamVersion, string, error) {
 
 var versionHTTPClient = &http.Client{Timeout: versionFetchTO}
 
-func fetchVersionPage(url string) ([]byte, error) {
+// checkUpdateResponse 是 /icube/api/v1/package/check_update 的响应形状（关注字段）。
+// 实测：本地已是最新时响应只有 {"data":{"needUpdate":false}}，不含 appVersion。
+type checkUpdateResponse struct {
+	ErrCode int    `json:"err_code"`
+	Data    struct {
+		NeedUpdate bool   `json:"needUpdate"`
+		AppVersion string `json:"appVersion"`
+	} `json:"data"`
+}
+
+// checkUpdateURL 构造 check_update 请求 URL（appVersion/buildVersion 传当前
+// 已知值，API 据此返回最新版；mid 非空即可，用内置固定值保证可复现）。
+func checkUpdateURL() string {
+	params := make([]string, 0, len(checkUpdateParams)+3)
+	params = append(params, checkUpdateParams...)
+	params = append(params,
+		"appVersion="+IdeVersion,
+		"buildVersion="+IdeBuildVersion,
+		"mid=0123456789abcdef0123456789abcdef",
+	)
+	return checkUpdateAPI + "?" + strings.Join(params, "&")
+}
+
+// probeCheckUpdateAPI 请求官方实时接口并解析 data.appVersion。
+// 成功返回该版本（src 记为 "api:"+checkUpdateAPI）。
+func probeCheckUpdateAPI() (upstreamVersion, string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), versionFetchTO)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, checkUpdateURL(), nil)
 	if err != nil {
-		return nil, err
+		return upstreamVersion{}, "", err
 	}
 	req.Header.Set("User-Agent", clientUAValue())
-	req.Header.Set("Accept", "text/html,application/xhtml+xml")
+	req.Header.Set("Accept", "application/json")
 	resp, err := versionHTTPClient.Do(req)
 	if err != nil {
-		return nil, err
+		return upstreamVersion{}, "", err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("http %d", resp.StatusCode)
+		return upstreamVersion{}, "", fmt.Errorf("http %d", resp.StatusCode)
 	}
-	return io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return upstreamVersion{}, "", err
+	}
+	return parseCheckUpdateResponse(body)
 }
 
-// parseVersionPage 按来源选择解析，返回第一个（最新的）TraeWork 版本。
-//
-// 先按 URL 域名分派；域名不认识时（源地址变更 / 测试用 httptest）退回按
-// 页面内容嗅探，避免换了域名就整个解析失效。两者都失败才算失败。
-func parseVersionPage(url string, body []byte) (upstreamVersion, error) {
-	switch {
-	case strings.Contains(url, "docs.trae.cn"):
-		return parseWorkChangelog(body)
-	case strings.Contains(url, "www.trae.cn"), strings.Contains(url, "/changelog"):
-		return parseChangelog(body)
+// parseCheckUpdateResponse 解析 check_update 的 JSON 响应。
+// 两种情况都视为成功：
+//   - needUpdate==true 且 data.appVersion 是合法三段式版本号 → 采纳新版本
+//   - needUpdate==false（本地已最新，响应不含 appVersion）→ 确认内置值仍最新
+// 其余（err_code!=0、appVersion 非法、结构缺失）一律失败，绝不产出垃圾值。
+func parseCheckUpdateResponse(body []byte) (upstreamVersion, string, error) {
+	var resp checkUpdateResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return upstreamVersion{}, "", fmt.Errorf("json: %w", err)
 	}
-	// 内容嗅探：结构化日期/版本块 → changelog；markdown "年月日" → work changelog
-	switch {
-	case reCLItem.Match(body):
-		return parseChangelog(body)
-	case reWorkDate.Match(body):
-		return parseWorkChangelog(body)
+	if resp.ErrCode != 0 {
+		return upstreamVersion{}, "", fmt.Errorf("err_code=%d", resp.ErrCode)
 	}
-	return parseChangelog(body)
-}
-
-// ---------------------------------------------------------------------------
-// 解析：www.trae.cn/changelog
-// ---------------------------------------------------------------------------
-//
-// 页面结构（实测 2026-09-08）：
-//
-//	<div class="metaItem-Mgnq7u date-FTRzTs">2026-08-21</div>
-//	<div class="metaItem-Mgnq7u version-b47QNh">v<!-- -->0.1.49-52</div>
-//	<span class="metaItem-Mgnq7u type-jZDufH">TraeWork</span>
-//
-// 只取 type=TraeWork（TraeWork 是 0.1.x 系列，与constants.go 同一条产品线）；
-// 页面结构变化 → 正则不命中 → 视为失败，绝不产出垃圾值。
-var (
-	reCLItem = regexp.MustCompile(`date-FTRzTs">(\d{4}-\d{2}-\d{2})</div>.*?version-b47QNh">v?(?:<!--\s*-->)?([0-9][0-9A-Za-z.\-]*?)</div><span class="metaItem-Mgnq7u type-jZDufH">([^<]+)<`)
-	// 兜底：宽松匹配 "v1.2.3" 文本
-	reCLFallback = regexp.MustCompile(`v?(\d+\.\d+\.\d+)(?:-(\d+))?`)
-)
-
-func parseChangelog(body []byte) (upstreamVersion, error) {
-	matches := reCLItem.FindAllStringSubmatch(string(body), -1)
-	for _, m := range matches {
-		if len(m) < 4 {
-			continue
-		}
-		date, rawVer, typ := m[1], m[2], strings.TrimSpace(m[3])
-		if !strings.EqualFold(typ, "TraeWork") {
-			continue
-		}
-		v, ok := normalizeVersion(rawVer)
+	var v string
+	if resp.Data.NeedUpdate {
+		norm, ok := normalizeVersion(strings.TrimSpace(resp.Data.AppVersion))
 		if !ok {
-			continue
+			return upstreamVersion{}, "", fmt.Errorf("appVersion %q not a valid version", resp.Data.AppVersion)
 		}
-		return upstreamVersion{IdeVersion: v, IdeVersionCode: dateToCode(date)}, nil
+		v = norm
+	} else {
+		// 本地已是最新：接口未回传版本号，视为确认当前内置版本为最新。
+		v = IdeVersion
 	}
-	// 结构变化 → 宽松兜底：仍要求 0.1.x（TraeWork 产品线），避免抓到 TraeCode 的 3.x
-	if m := reCLFallback.FindStringSubmatch(string(body)); m != nil {
-		if strings.HasPrefix(m[1], "0.1.") || strings.HasPrefix(m[1], "0.0.") {
-			return upstreamVersion{IdeVersion: m[1]}, nil
-		}
-	}
-	return upstreamVersion{}, fmt.Errorf("changelog: no TraeWork version found")
-}
-
-// ---------------------------------------------------------------------------
-// 解析：docs.trae.cn/work_changelog（markdown 渲染）
-// ---------------------------------------------------------------------------
-//
-// 页面结构（实测 2026-09-08）：
-//
-//	<h2 id="...">2026 年 08 月 21 日</h2>
-//	<p>TraeWork 桌面版 v0.1.49 ~ 0.1.52 版本正式发布，...</p>
-var (
-	reWorkDate = regexp.MustCompile(`(20\d{2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日`)
-	reWorkVer  = regexp.MustCompile(`v?(\d+\.\d+\.\d+)\s*[~～]\s*v?(\d+\.\d+\.\d+)`)
-	// 单版本形态："v0.1.52 版本正式发布"
-	reWorkSingle = regexp.MustCompile(`v?(\d+\.\d+\.\d+)\s*版本`)
-)
-
-func parseWorkChangelog(body []byte) (upstreamVersion, error) {
-	s := string(body)
-	// 第一个 <h2> 日期 + 紧随其后的版本区间
-	dm := reWorkDate.FindStringSubmatch(s)
-	vm := reWorkVer.FindStringSubmatch(s)
-	if vm == nil {
-		if sm := reWorkSingle.FindStringSubmatch(s); sm != nil {
-			return upstreamVersion{IdeVersion: sm[1], IdeVersionCode: dateToCode(dateCNToISO(dm))}, nil
-		}
-		return upstreamVersion{}, fmt.Errorf("work_changelog: no version found")
-	}
-	// 区间取上界（如 "v0.1.49 ~ 0.1.52" → 0.1.52）
-	hi := vm[2]
-	var code string
-	if dm != nil {
-		code = dateToCode(dateCNToISO(dm))
-	}
-	return upstreamVersion{IdeVersion: hi, IdeVersionCode: code}, nil
+	// check_update 不返回日期型 version code（IdeVersionCode），沿用内置值。
+	return upstreamVersion{IdeVersion: v, IdeVersionCode: IdeVersionCode}, "api:" + checkUpdateAPI, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -459,20 +418,6 @@ func dateToCode(iso string) string {
 	return fmt.Sprintf("%04d%02d%02d", y, m, d)
 }
 
-// dateCNToISO "2026 年 08 月 21 日" 的 submatch → "2026-08-21"
-func dateCNToISO(m []string) string {
-	if len(m) < 4 {
-		return ""
-	}
-	y, _ := strconv.Atoi(m[1])
-	mo, _ := strconv.Atoi(m[2])
-	d, _ := strconv.Atoi(m[3])
-	if y < 2000 || mo < 1 || mo > 12 || d < 1 || d > 31 {
-		return ""
-	}
-	return fmt.Sprintf("%04d-%02d-%02d", y, mo, d)
-}
-
 // ---------------------------------------------------------------------------
 // 供 headers/client 使用的访问器（替代直接读常量）
 // ---------------------------------------------------------------------------
@@ -506,7 +451,7 @@ func versionStatus() map[string]any {
 		"ide_version":  ideVersion(),
 		"version_code": ideVersionCode(),
 		"builtin":      map[string]any{"ide_version": IdeVersion, "version_code": IdeVersionCode},
-		"sources":      webSourceURLs(),
+		"sources":      versionSources(),
 	}
 	if e != nil {
 		out["cache"] = map[string]any{

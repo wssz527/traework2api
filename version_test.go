@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -11,95 +12,145 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// 版本解析（静态 HTML 样例）
+// 版本解析：check_update API（主源）
 // ---------------------------------------------------------------------------
 
-// stubWebSources 把网页源指向不可达地址，保证单测不依赖真实外网。
-// 返回 restore 函数。
-func stubWebSources(t *testing.T) {
+// stubAPIWithCapture 把 checkUpdateAPI 指向一个返回给定 body 的 httptest，返回
+// handler 捕获请求的访问器（用于断言参数）。restore 由 t.Cleanup 保证。
+func stubAPIWithCapture(t *testing.T, body string, status int) func() *http.Request {
 	t.Helper()
-	oldA, oldB := srcChangelog, srcWorkChangelog
-	dead := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
-	dead.Close()
-	srcChangelog, srcWorkChangelog = dead.URL, dead.URL
-	t.Cleanup(func() { srcChangelog, srcWorkChangelog = oldA, oldB })
+	var captured *http.Request
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		captured = r
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+	old := checkUpdateAPI
+	checkUpdateAPI = srv.URL
+	t.Cleanup(func() { checkUpdateAPI = old })
+	return func() *http.Request { return captured }
 }
 
-func TestParseChangelogFromFixture(t *testing.T) {
-	v, err := parseChangelog([]byte(fixtureChangelog))
+func apiBody(appVersion string) string {
+	b, _ := json.Marshal(map[string]any{
+		"err_code": 0,
+		"err_message": "success",
+		"data": map[string]any{
+			"needUpdate": true,
+			"appVersion": appVersion,
+			"manifest": map[string]any{
+				"darwin": map[string]any{"version": "2.3.81345"},
+			},
+		},
+	})
+	return string(b)
+}
+
+// TestParseCheckUpdateResponse 主源成功：err_code=0 + 合法 appVersion → 采纳。
+func TestParseCheckUpdateResponse(t *testing.T) {
+	v, src, err := parseCheckUpdateResponse([]byte(apiBody("0.1.70")))
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	// 样例最新 TraeWork 条目是 v0.1.49-52（2026-08-21）
-	if v.IdeVersion != "0.1.49" {
-		t.Errorf("IdeVersion=%q want 0.1.49", v.IdeVersion)
+	if v.IdeVersion != "0.1.70" {
+		t.Errorf("IdeVersion=%q want 0.1.70", v.IdeVersion)
 	}
-	if v.IdeVersionCode != "20260821" {
-		t.Errorf("IdeVersionCode=%q want 20260821 (页面日期)", v.IdeVersionCode)
+	// check_update 不返回日期型 code → 沿用内置
+	if v.IdeVersionCode != IdeVersionCode {
+		t.Errorf("code=%q want built-in %q", v.IdeVersionCode, IdeVersionCode)
+	}
+	if !strings.HasPrefix(src, "api:") {
+		t.Errorf("src=%q want api: prefix", src)
 	}
 }
 
-// TestParseChangelogSkipsOtherProductLines 页面同时有 TraeCode(3.x) 与
-// TRAE APP(0.0.x)；必须只取 TraeWork（0.1.x），否则会拿到错误产品线。
-func TestParseChangelogSkipsOtherProductLines(t *testing.T) {
-	v, err := parseChangelog([]byte(fixtureChangelog))
+// TestParseCheckUpdateNoUpdate 本地已最新的响应只有 {"needUpdate":false} 无
+// appVersion；此时视为确认内置版本仍最新 → 成功返回内置值。
+func TestParseCheckUpdateNoUpdate(t *testing.T) {
+	v, src, err := parseCheckUpdateResponse([]byte(`{"err_code":0,"data":{"needUpdate":false}}`))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("parse no-update: %v", err)
 	}
-	if strings.HasPrefix(v.IdeVersion, "3.") {
-		t.Errorf("picked TraeCode line: %s", v.IdeVersion)
+	if v.IdeVersion != IdeVersion {
+		t.Errorf("IdeVersion=%q want built-in %q", v.IdeVersion, IdeVersion)
 	}
-	if !strings.HasPrefix(v.IdeVersion, "0.1.") && !strings.HasPrefix(v.IdeVersion, "0.0.") {
-		t.Errorf("picked unexpected product line: %s", v.IdeVersion)
+	if v.IdeVersionCode != IdeVersionCode {
+		t.Errorf("code=%q want built-in %q", v.IdeVersionCode, IdeVersionCode)
 	}
-}
-
-func TestParseWorkChangelogFromFixture(t *testing.T) {
-	v, err := parseWorkChangelog([]byte(fixtureWorkChangelog))
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-	// "TraeWork 桌面版 v0.1.49 ~ 0.1.52 版本正式发布" → 取上界 0.1.52
-	if v.IdeVersion != "0.1.52" {
-		t.Errorf("IdeVersion=%q want 0.1.52 (区间上界)", v.IdeVersion)
-	}
-	if v.IdeVersionCode != "20260821" {
-		t.Errorf("IdeVersionCode=%q want 20260821", v.IdeVersionCode)
+	if !strings.HasPrefix(src, "api:") {
+		t.Errorf("src=%q want api: prefix", src)
 	}
 }
 
-func TestParseWorkChangelogSingleVersion(t *testing.T) {
-	html := `<h2 id="x">2026 年 09 月 08 日</h2><p>TraeWork 桌面版 v0.1.63 版本正式发布。</p>`
-	v, err := parseWorkChangelog([]byte(html))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if v.IdeVersion != "0.1.63" || v.IdeVersionCode != "20260908" {
-		t.Errorf("got %+v", v)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// 保守性：抓不到就是失败，绝不产出垃圾值
-// ---------------------------------------------------------------------------
-
-func TestParseRejectsGarbage(t *testing.T) {
-	garbage := []string{
+// TestParseCheckUpdateRejectsErrors err_code != 0 / 结构缺失 → 失败。
+func TestParseCheckUpdateRejectsErrors(t *testing.T) {
+	cases := []string{
+		`{"err_code":1000,"err_message":"missing mid","data":{}}`,
+		`{"err_code":1000,"data":{"needUpdate":true,"appVersion":"0.1.63"}}`,
+		`not json`,
 		``,
-		`<html><body>维护中</body></html>`,
-		`<div>版本号：最新</div>`,
-		`<div>download v3</div>`,
-		`<div>1.2.3.4.5.6</div>`,
+		`{"err_code":0,"data":{"needUpdate":true,"appVersion":"v"}}`,
 	}
-	for _, g := range garbage {
-		if _, err := parseChangelog([]byte(g)); err == nil {
-			// 兜底正则可能命中 0.1.x/0.0.x；非该形态必须失败
-			if !strings.Contains(g, "0.1.") && !strings.Contains(g, "0.0.") {
-				t.Errorf("garbage %q should not parse", g)
-			}
+	for _, c := range cases {
+		if _, _, err := parseCheckUpdateResponse([]byte(c)); err == nil {
+			t.Errorf("body %q should fail to parse", c)
 		}
 	}
 }
+
+// TestCheckUpdateURLHasRequiredParams 请求 URL 必须带文档要求的最小参数集。
+func TestCheckUpdateURLHasRequiredParams(t *testing.T) {
+	u := checkUpdateURL()
+	for _, want := range []string{
+		"branch=release_solo_cn",
+		"packageType=stable_cn",
+		"productCode=SOLO_Lite",
+		"platform=Mac",
+		"arch=arm64",
+		"appVersion=" + IdeVersion,
+		"buildVersion=" + IdeBuildVersion,
+		"mid=",
+	} {
+		if !strings.Contains(u, want) {
+			t.Errorf("checkUpdateURL missing %q in %q", want, u)
+		}
+	}
+}
+
+// TestProbeCheckUpdateAPINetwork 端到端走真实 HTTP：httptest 返回新版 → 采纳。
+func TestProbeCheckUpdateAPINetwork(t *testing.T) {
+	capture := stubAPIWithCapture(t, apiBody("0.2.0"), 200)
+	v, src, err := probeCheckUpdateAPI()
+	if err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if v.IdeVersion != "0.2.0" {
+		t.Errorf("IdeVersion=%q want 0.2.0", v.IdeVersion)
+	}
+	if !strings.HasPrefix(src, "api:") {
+		t.Errorf("src=%q", src)
+	}
+	req := capture()
+	if req == nil {
+		t.Fatal("handler did not capture request")
+	}
+	if q := req.URL.Query(); q.Get("mid") == "" {
+		t.Error("mid param must be present")
+	}
+}
+
+// TestProbeCheckUpdateAPIHTTPError 非 200 → 失败。
+func TestProbeCheckUpdateAPIHTTPError(t *testing.T) {
+	stubAPIWithCapture(t, "boom", 500)
+	if _, _, err := probeCheckUpdateAPI(); err == nil {
+		t.Fatal("HTTP 500 should fail")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 版本工具（与源无关）
+// ---------------------------------------------------------------------------
 
 func TestNormalizeVersion(t *testing.T) {
 	cases := []struct{ in, want string }{
@@ -168,16 +219,14 @@ func TestDateToCode(t *testing.T) {
 		{"2026-00-10", ""},
 	}
 	for _, c := range cases {
-		if got := dateToCode(c.in); got != want(c.want) {
+		if got := dateToCode(c.in); got != c.want {
 			t.Errorf("dateToCode(%q)=%q want %q", c.in, got, c.want)
 		}
 	}
 }
 
-func want(s string) string { return s }
-
 // ---------------------------------------------------------------------------
-// 三级回退优先级
+// 本机客户端探测（第二优先级；客户端已卸载时可省略）
 // ---------------------------------------------------------------------------
 
 func TestProbeLocalClientReadsPlist(t *testing.T) {
@@ -216,61 +265,116 @@ func TestProbeLocalClientMissingFile(t *testing.T) {
 	}
 }
 
-// TestProbePrefersNewestAcrossSources 多个来源都成功时取版本最大的那个。
-func TestProbePrefersNewestAcrossSources(t *testing.T) {
-	srcA := `<div class="metaItem-Mgnq7u date-FTRzTs">2026-08-01</div><div class="metaItem-Mgnq7u version-b47QNh">v0.1.40</div><span class="metaItem-Mgnq7u type-jZDufH">TraeWork</span>`
-	srcB := `<h2>2026 年 08 月 21 日</h2><p>TraeWork 桌面版 v0.1.49 ~ 0.1.52 版本正式发布。</p>`
+// ---------------------------------------------------------------------------
+// 源优先级：①API（主源）②本机 ③内置下限
+// ---------------------------------------------------------------------------
 
-	v1, err1 := parseVersionPage(srcChangelog, []byte(srcA))
-	v2, err2 := parseVersionPage(srcWorkChangelog, []byte(srcB))
-	if err1 != nil || err2 != nil {
-		t.Fatalf("parse: %v / %v", err1, err2)
+func writePlist(t *testing.T, version string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "Info.plist")
+	content := `<dict><key>CFBundleShortVersionString</key><string>` + version + `</string></dict>`
+	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	best := v1
-	if compareVersions(v2.IdeVersion, best.IdeVersion) > 0 {
-		best = v2
+	return p
+}
+
+// withSources 把 checkUpdateAPI 指向给定 httptest body/status，并把本机路径
+// 指向给定 plist（空串 → 无本机客户端）。restore 全部由 t.Cleanup 保证。
+func withSources(t *testing.T, apiBodyStr string, apiStatus int, localPlist string) {
+	t.Helper()
+	oldAPI := checkUpdateAPI
+	checkUpdateAPI = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(apiStatus)
+		_, _ = w.Write([]byte(apiBodyStr))
+	})).URL
+	t.Cleanup(func() { checkUpdateAPI = oldAPI })
+
+	oldPaths := localClientPaths
+	if localPlist == "" {
+		localClientPaths = nil
+	} else {
+		localClientPaths = []string{localPlist}
 	}
-	if best.IdeVersion != "0.1.52" {
-		t.Errorf("best=%s want 0.1.52 (newest of the two sources)", best.IdeVersion)
+	t.Cleanup(func() { localClientPaths = oldPaths })
+}
+
+// TestAPISourceWins API 可用且比本机新 → 用 API 值（主源优先）。
+func TestAPISourceWins(t *testing.T) {
+	withSources(t, apiBody("0.1.80"), 200, writePlist(t, "0.1.10"))
+	v, src, err := probeUpstreamVersion()
+	if err != nil {
+		t.Fatal(err)
 	}
-	// 两者都胜过更旧的本机客户端版本
-	if compareVersions(best.IdeVersion, "0.1.20") <= 0 {
-		t.Error("web sources should beat the older local client")
+	if v.IdeVersion != "0.1.80" {
+		t.Errorf("IdeVersion=%q want 0.1.80 (API beats local)", v.IdeVersion)
 	}
-	// 取最大值的逻辑对调顺序后结果不变（可交换）
-	alt := v2
-	if compareVersions(v1.IdeVersion, alt.IdeVersion) > 0 {
-		alt = v1
-	}
-	if alt.IdeVersion != best.IdeVersion {
-		t.Errorf("max selection is not commutative: %s vs %s", alt.IdeVersion, best.IdeVersion)
+	if !strings.HasPrefix(src, "api:") {
+		t.Errorf("src=%q want api: prefix", src)
 	}
 }
 
-// TestWebSourceFailureFallsBackToLocal 网页源全挂 → 回退本机客户端。
-func TestWebSourceFailureFallsBackToLocal(t *testing.T) {
-	dir := t.TempDir()
-	p := filepath.Join(dir, "Info.plist")
-	_ = os.WriteFile(p, []byte(`<dict><key>CFBundleShortVersionString</key><string>0.1.80</string></dict>`), 0o600)
-
-	orig := localClientPaths
-	defer func() { localClientPaths = orig }()
-	localClientPaths = []string{p}
-
-	// 网页源不可达：关闭的 server
-	dead := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
-	dead.Close()
-	if _, err := fetchVersionPage(dead.URL); err == nil {
-		t.Error("dead source should fail")
-	}
-
-	// 本机探测仍然可用 → 三级回退的第二级生效
-	v, err := probeLocalClient(p)
+// TestLocalBeatsStaleAPI API 返回旧值、本机更新 → 取本机（只进不退的一半）。
+func TestLocalBeatsStaleAPI(t *testing.T) {
+	withSources(t, apiBody("0.1.20"), 200, writePlist(t, "0.1.63"))
+	v, _, err := probeUpstreamVersion()
 	if err != nil {
-		t.Fatalf("local fallback should still work: %v", err)
+		t.Fatal(err)
 	}
-	if v.IdeVersion != "0.1.80" {
-		t.Errorf("local fallback version=%q want 0.1.80", v.IdeVersion)
+	if v.IdeVersion != "0.1.63" {
+		t.Errorf("IdeVersion=%q want 0.1.63 (local beats stale API)", v.IdeVersion)
+	}
+}
+
+// TestAPIFailureFallsBackToLocal API 挂 → 回退本机客户端。
+func TestAPIFailureFallsBackToLocal(t *testing.T) {
+	plist := writePlist(t, "0.1.85")
+	withSources(t, "boom", 500, plist)
+	v, src, err := probeUpstreamVersion()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.IdeVersion != "0.1.85" {
+		t.Errorf("IdeVersion=%q want 0.1.85 (local client)", v.IdeVersion)
+	}
+	if !strings.HasPrefix(src, "local:") {
+		t.Errorf("src=%q want local: prefix", src)
+	}
+	// 本机 plist 无日期型 code → 沿用内置
+	if v.IdeVersionCode != IdeVersionCode {
+		t.Errorf("code=%q want built-in %q", v.IdeVersionCode, IdeVersionCode)
+	}
+}
+
+// TestAllSourcesFail API 与本机都不可用（如客户端已卸载）→ 返回错误，调用方
+// 回退内置常量。
+func TestAllSourcesFail(t *testing.T) {
+	withSources(t, "boom", 500, "")
+	_, _, err := probeUpstreamVersion()
+	if err == nil {
+		t.Fatal("all sources failing should return an error")
+	}
+	if !validVersion(IdeVersion) {
+		t.Errorf("built-in %q must remain a valid fallback", IdeVersion)
+	}
+	if got := ideVersion(); got != IdeVersion {
+		t.Errorf("final fallback=%q want %q", got, IdeVersion)
+	}
+}
+
+// TestLocalClientUninstalledIsOptional 用户卸载客户端后：localClientPaths 为空，
+// API 正常时仍可用（本地源可有可无）。
+func TestLocalClientUninstalledIsOptional(t *testing.T) {
+	withSources(t, apiBody("0.1.90"), 200, "")
+	v, src, err := probeUpstreamVersion()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.IdeVersion != "0.1.90" {
+		t.Errorf("IdeVersion=%q want 0.1.90", v.IdeVersion)
+	}
+	if !strings.HasPrefix(src, "api:") {
+		t.Errorf("src=%q want api: prefix", src)
 	}
 }
 
@@ -278,21 +382,45 @@ func TestWebSourceFailureFallsBackToLocal(t *testing.T) {
 // 只进不退保护（关键）
 // ---------------------------------------------------------------------------
 
-// TestRefreshNeverDowngradesBelowBuiltin 网页源落后于内置常量时（实测两个源
-// 都停在 0.1.49，而内置是 0.1.63），必须保留内置值——否则是回退不是跟踪。
+func TestVersionFloorGuard(t *testing.T) {
+	candidate := upstreamVersion{IdeVersion: "0.1.49", IdeVersionCode: "20260821"}
+	if compareVersions(candidate.IdeVersion, IdeVersion) >= 0 {
+		t.Skip("built-in is not newer than the candidate; skip guard assertion")
+	}
+	final := candidate
+	if compareVersions(candidate.IdeVersion, IdeVersion) < 0 {
+		final = builtinVersion()
+	}
+	if final.IdeVersion != IdeVersion {
+		t.Errorf("guard failed: got %q want built-in %q", final.IdeVersion, IdeVersion)
+	}
+}
+
+func TestHigherVersionIsAccepted(t *testing.T) {
+	candidate := upstreamVersion{IdeVersion: "0.2.0", IdeVersionCode: "20261001"}
+	final := candidate
+	if compareVersions(candidate.IdeVersion, IdeVersion) < 0 {
+		final = builtinVersion()
+	}
+	if final.IdeVersion != "0.2.0" {
+		t.Errorf("newer version should be adopted, got %q", final.IdeVersion)
+	}
+}
+
+// TestRefreshNeverDowngradesBelowBuiltin 所有源返回都低于内置（如本地 0.1.10）时，
+// 刷新路径按"只进不退"收敛，最终必须保留内置值。
 func TestRefreshNeverDowngradesBelowBuiltin(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "Info.plist")
 	_ = os.WriteFile(p, []byte(`<dict><key>CFBundleShortVersionString</key><string>0.1.10</string></dict>`), 0o600)
 	orig := localClientPaths
 	defer func() { localClientPaths = orig }()
-	localClientPaths = []string{p} // 本机版本远低于内置
+	localClientPaths = []string{p}
 
 	resetVersionCacheForTest()
 	defer resetVersionCacheForTest()
 
-	// 缓存里塞一个旧版本并强制刷新路径按"只进不退"收敛：
-	// 直接调用守卫逻辑的等价路径 —— 用 setVersionCacheForTest + 读取断言
+	// 缓存里塞一个旧版本并读取断言
 	setVersionCacheForTest(upstreamVersion{IdeVersion: "0.1.10"}, true, "test")
 	if got := ideVersion(); got != "0.1.10" {
 		t.Fatalf("cache not honored: %q", got)
@@ -309,32 +437,24 @@ func TestRefreshNeverDowngradesBelowBuiltin(t *testing.T) {
 	}
 }
 
-// TestVersionFloorGuard 内置常量是下限：任何低于它的候选都被丢弃。
-func TestVersionFloorGuard(t *testing.T) {
-	// 模拟：探测到 0.1.49（网页当前值），内置 0.1.63
-	candidate := upstreamVersion{IdeVersion: "0.1.49", IdeVersionCode: "20260821"}
-	if compareVersions(candidate.IdeVersion, IdeVersion) >= 0 {
-		t.Skip("built-in is not newer than the web value; skip guard assertion")
-	}
-	// 守卫：低于内置 → 沿用内置
-	final := candidate
-	if compareVersions(candidate.IdeVersion, IdeVersion) < 0 {
-		final = builtinVersion()
-	}
-	if final.IdeVersion != IdeVersion {
-		t.Errorf("guard failed: got %q want built-in %q", final.IdeVersion, IdeVersion)
-	}
-}
+// TestEndToEndRefreshKeepsBuiltinWhenSourcesStale 端到端刷新：API 返回低于内置
+// 的值时，仍必须保留内置（防止版本被降）。
+func TestEndToEndRefreshKeepsBuiltinWhenSourcesStale(t *testing.T) {
+	origTrack := versionTrackingEnabled()
+	defer func() {
+		setVersionTracking(origTrack)
+		resetVersionCacheForTest()
+	}()
+	setVersionTracking(true)
+	resetVersionCacheForTest()
+	withSources(t, apiBody("0.1.10"), 200, "")
 
-func TestHigherVersionIsAccepted(t *testing.T) {
-	// 模拟上游发新版 0.2.0：必须被采纳
-	candidate := upstreamVersion{IdeVersion: "0.2.0", IdeVersionCode: "20261001"}
-	final := candidate
-	if compareVersions(candidate.IdeVersion, IdeVersion) < 0 {
-		final = builtinVersion()
+	refreshUpstreamVersion()
+	if got := ideVersion(); got != IdeVersion {
+		t.Errorf("stale API must not downgrade: ideVersion=%q want built-in %q", got, IdeVersion)
 	}
-	if final.IdeVersion != "0.2.0" {
-		t.Errorf("newer version should be adopted, got %q", final.IdeVersion)
+	if got := ideVersionCode(); got != IdeVersionCode {
+		t.Errorf("stale API must not downgrade: code=%q want %q", got, IdeVersionCode)
 	}
 }
 
@@ -367,7 +487,6 @@ func TestCurrentVersionFallsBackOnNegativeCache(t *testing.T) {
 	}()
 	setVersionTracking(true)
 
-	// 负缓存（探测失败）→ 用内置常量
 	setVersionCacheForTest(upstreamVersion{}, false, "")
 	if got := ideVersion(); got != IdeVersion {
 		t.Errorf("negative cache should fall back to built-in, got %q", got)
@@ -375,14 +494,19 @@ func TestCurrentVersionFallsBackOnNegativeCache(t *testing.T) {
 }
 
 func TestCurrentVersionNeverBlocks(t *testing.T) {
-	stubWebSources(t)
+	// 把 API 指向不可达地址，确保即便超时也必须立即返回内置值
+	dead := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	dead.Close()
+	old := checkUpdateAPI
+	checkUpdateAPI = dead.URL
+	t.Cleanup(func() { checkUpdateAPI = old })
+
 	origTrack := versionTrackingEnabled()
 	defer func() {
 		setVersionTracking(origTrack)
 		resetVersionCacheForTest()
 	}()
 	setVersionTracking(true)
-	// 无缓存且网页不可达（默认常量指向真实外网，但即便超时也必须立即返回）
 	done := make(chan string, 1)
 	start := time.Now()
 	go func() {
@@ -422,7 +546,13 @@ func TestVersionStatusShape(t *testing.T) {
 	}
 	srcs, ok := out["sources"].([]string)
 	if !ok || len(srcs) != 2 {
-		t.Errorf("sources=%v", out["sources"])
+		t.Fatalf("sources=%v", out["sources"])
+	}
+	if !strings.HasPrefix(srcs[0], "api:") {
+		t.Errorf("sources[0]=%q want api: prefix (main source first)", srcs[0])
+	}
+	if !strings.HasPrefix(srcs[1], "local:") {
+		t.Errorf("sources[1]=%q want local: prefix", srcs[1])
 	}
 }
 
@@ -453,30 +583,14 @@ func TestVersionIntervalConfig(t *testing.T) {
 }
 
 func TestEnsureVersionTrackerIdempotent(t *testing.T) {
-	stubWebSources(t)
 	ensureVersionTracker()
 	ensureVersionTracker() // 第二次必须是 no-op
 }
 
-// TestParseVersionPageDispatchesByURL 不同来源走不同解析。
-func TestParseVersionPageDispatchesByURL(t *testing.T) {
-	v, err := parseVersionPage(srcWorkChangelog, []byte(fixtureWorkChangelog))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if v.IdeVersion != "0.1.52" {
-		t.Errorf("docs source dispatched wrong: %s", v.IdeVersion)
-	}
-	v2, err := parseVersionPage(srcChangelog, []byte(fixtureChangelog))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if v2.IdeVersion != "0.1.49" {
-		t.Errorf("www source dispatched wrong: %s", v2.IdeVersion)
-	}
-}
+// ---------------------------------------------------------------------------
+// 请求头使用跟踪结果
+// ---------------------------------------------------------------------------
 
-// TestHeadersUseTrackedVersion 请求头必须读跟踪结果，而不是常量。
 func TestHeadersUseTrackedVersion(t *testing.T) {
 	origTrack := versionTrackingEnabled()
 	defer func() {
@@ -500,13 +614,11 @@ func TestHeadersUseTrackedVersion(t *testing.T) {
 	if got := req.Header.Get("X-App-Version-Code"); got != "20261225" {
 		t.Errorf("X-App-Version-Code=%q", got)
 	}
-	// 与产品线无关的常量头不得被版本跟踪改动
 	if got := req.Header.Get("X-Ide-Version-Type"); got != "stable" {
 		t.Errorf("X-Ide-Version-Type=%q", got)
 	}
 }
 
-// TestHeadersFallbackToBuiltin 无缓存时头里必须是内置常量值。
 func TestHeadersFallbackToBuiltin(t *testing.T) {
 	orig := versionTrackingEnabled()
 	defer func() {
@@ -524,7 +636,10 @@ func TestHeadersFallbackToBuiltin(t *testing.T) {
 	}
 }
 
-// TestVersionRefreshRecoversFromPanic 刷新路径 panic 不得逃逸。
+// ---------------------------------------------------------------------------
+// 刷新路径健壮性
+// ---------------------------------------------------------------------------
+
 func TestVersionRefreshRecoversFromPanic(t *testing.T) {
 	orig := localClientPaths
 	defer func() { localClientPaths = orig }()
@@ -536,8 +651,13 @@ func TestVersionRefreshRecoversFromPanic(t *testing.T) {
 	}()
 	setVersionTracking(true)
 	resetVersionCacheForTest()
-	stubWebSources(t)
-	// 所有来源都不可用 → 负缓存，不得 panic
+	// API 指向不可达地址 → 负缓存，不得 panic
+	dead := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	dead.Close()
+	old := checkUpdateAPI
+	checkUpdateAPI = dead.URL
+	t.Cleanup(func() { checkUpdateAPI = old })
+
 	probeAndStoreVersion()
 	e := versionCache.Load()
 	if e == nil {
@@ -551,178 +671,6 @@ func TestVersionRefreshRecoversFromPanic(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// 三级回退：用 httptest 完整驱动 probeUpstreamVersion
-// ---------------------------------------------------------------------------
-
-// withStubbedSources 把两个网页源分别指向给定的 httptest，本机路径指向给定 plist。
-func withStubbedSources(t *testing.T, bodyA, bodyB string, statusA, statusB int, localPlist string) {
-	t.Helper()
-	srvA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(statusA)
-		_, _ = w.Write([]byte(bodyA))
-	}))
-	srvB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(statusB)
-		_, _ = w.Write([]byte(bodyB))
-	}))
-	t.Cleanup(func() { srvA.Close(); srvB.Close() })
-	oldA, oldB := srcChangelog, srcWorkChangelog
-	srcChangelog, srcWorkChangelog = srvA.URL, srvB.URL
-	t.Cleanup(func() { srcChangelog, srcWorkChangelog = oldA, oldB })
-
-	oldPaths := localClientPaths
-	if localPlist == "" {
-		localClientPaths = nil
-	} else {
-		localClientPaths = []string{localPlist}
-	}
-	t.Cleanup(func() { localClientPaths = oldPaths })
-}
-
-func writePlist(t *testing.T, version string) string {
-	t.Helper()
-	p := filepath.Join(t.TempDir(), "Info.plist")
-	content := `<dict><key>CFBundleShortVersionString</key><string>` + version + `</string></dict>`
-	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	return p
-}
-
-const stubChangelogBody = `<div class="metaItem-Mgnq7u date-FTRzTs">2026-10-01</div><div class="metaItem-Mgnq7u version-b47QNh">v0.2.5</div><span class="metaItem-Mgnq7u type-jZDufH">TraeWork</span>`
-const stubWorkBody = `<h2>2026 年 09 月 30 日</h2><p>TraeWork 桌面版 v0.2.1 ~ 0.2.3 版本正式发布。</p>`
-
-// TestTier1WebWins 网页源可用且比内置新 → 用网页值（取两源较大者）。
-func TestTier1WebWins(t *testing.T) {
-	withStubbedSources(t, stubChangelogBody, stubWorkBody, 200, 200, writePlist(t, "0.1.10"))
-	v, src, err := probeUpstreamVersion()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if v.IdeVersion != "0.2.5" {
-		t.Errorf("IdeVersion=%q want 0.2.5 (max of 0.2.5 / 0.2.3 / local 0.1.10)", v.IdeVersion)
-	}
-	if v.IdeVersionCode != "20261001" {
-		t.Errorf("code=%q want 20261001", v.IdeVersionCode)
-	}
-	if src != srcChangelog {
-		t.Errorf("src=%q want the changelog source", src)
-	}
-}
-
-// TestTier1PartialFailure 一个网页源挂了，另一个仍能提供值。
-func TestTier1PartialFailure(t *testing.T) {
-	withStubbedSources(t, "", stubWorkBody, 500, 200, "")
-	v, src, err := probeUpstreamVersion()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if v.IdeVersion != "0.2.3" {
-		t.Errorf("IdeVersion=%q want 0.2.3 from the surviving source", v.IdeVersion)
-	}
-	if src != srcWorkChangelog {
-		t.Errorf("src=%q", src)
-	}
-}
-
-// TestTier2LocalFallback 两个网页源都挂 → 回退本机客户端。
-func TestTier2LocalFallback(t *testing.T) {
-	plist := writePlist(t, "0.1.85")
-	withStubbedSources(t, "boom", "boom", 500, 500, plist)
-	v, src, err := probeUpstreamVersion()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if v.IdeVersion != "0.1.85" {
-		t.Errorf("IdeVersion=%q want 0.1.85 (local client)", v.IdeVersion)
-	}
-	if !strings.HasPrefix(src, "local:") {
-		t.Errorf("src=%q want local: prefix", src)
-	}
-	// 本机 plist 无日期型 code → 沿用内置
-	if v.IdeVersionCode != IdeVersionCode {
-		t.Errorf("code=%q want built-in %q", v.IdeVersionCode, IdeVersionCode)
-	}
-}
-
-// TestTier3Builtin 三级全不可用 → 返回错误，调用方回退内置常量。
-func TestTier3Builtin(t *testing.T) {
-	withStubbedSources(t, "boom", "boom", 500, 500, "")
-	_, _, err := probeUpstreamVersion()
-	if err == nil {
-		t.Fatal("all sources failing should return an error")
-	}
-	// 回退：内置常量仍然是有效值
-	if !validVersion(IdeVersion) {
-		t.Errorf("built-in %q must remain a valid fallback", IdeVersion)
-	}
-	if got := ideVersion(); got != IdeVersion {
-		t.Errorf("final fallback=%q want %q", got, IdeVersion)
-	}
-}
-
-// TestWebLagsBehindLocal 网页落后于本机 → 取本机的更大值（只进不退的一半）。
-func TestWebLagsBehindLocal(t *testing.T) {
-	old := `<div class="metaItem-Mgnq7u date-FTRzTs">2026-08-21</div><div class="metaItem-Mgnq7u version-b47QNh">v0.1.49</div><span class="metaItem-Mgnq7u type-jZDufH">TraeWork</span>`
-	withStubbedSources(t, old, old, 200, 200, writePlist(t, "0.1.63"))
-	v, _, err := probeUpstreamVersion()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if v.IdeVersion != "0.1.63" {
-		t.Errorf("IdeVersion=%q want 0.1.63 (local beats stale web)", v.IdeVersion)
-	}
-}
-
-// TestEndToEndRefreshUsesWebValue 完整走 refreshUpstreamVersion：
-// 网页更新 → 缓存写入 → 后续读取用新值。
-func TestEndToEndRefreshUsesWebValue(t *testing.T) {
-	origTrack := versionTrackingEnabled()
-	defer func() {
-		setVersionTracking(origTrack)
-		resetVersionCacheForTest()
-	}()
-	setVersionTracking(true)
-	resetVersionCacheForTest()
-	withStubbedSources(t, stubChangelogBody, stubWorkBody, 200, 200, writePlist(t, "0.1.10"))
-
-	refreshUpstreamVersion()
-	e := versionCache.Load()
-	if e == nil || !e.ok {
-		t.Fatalf("refresh should cache a positive result, got %+v", e)
-	}
-	if got := ideVersion(); got != "0.2.5" {
-		t.Errorf("ideVersion=%q want 0.2.5", got)
-	}
-	if got := ideVersionCode(); got != "20261001" {
-		t.Errorf("ideVersionCode=%q want 20261001", got)
-	}
-}
-
-// TestEndToEndRefreshKeepsBuiltinWhenWebStale 网页落后于内置常量时，
-// 端到端刷新后仍必须保留内置值（防止版本被降）。
-func TestEndToEndRefreshKeepsBuiltinWhenWebStale(t *testing.T) {
-	stale := `<div class="metaItem-Mgnq7u date-FTRzTs">2026-08-21</div><div class="metaItem-Mgnq7u version-b47QNh">v0.1.49</div><span class="metaItem-Mgnq7u type-jZDufH">TraeWork</span>`
-	origTrack := versionTrackingEnabled()
-	defer func() {
-		setVersionTracking(origTrack)
-		resetVersionCacheForTest()
-	}()
-	setVersionTracking(true)
-	resetVersionCacheForTest()
-	withStubbedSources(t, stale, stale, 200, 200, "")
-
-	refreshUpstreamVersion()
-	if got := ideVersion(); got != IdeVersion {
-		t.Errorf("stale web must not downgrade: ideVersion=%q want built-in %q", got, IdeVersion)
-	}
-	if got := ideVersionCode(); got != IdeVersionCode {
-		t.Errorf("stale web must not downgrade: code=%q want %q", got, IdeVersionCode)
-	}
-}
-
-// TestNegativeCacheTTL 失败后写负缓存，且负缓存未到期不再重复探测。
 func TestNegativeCacheTTL(t *testing.T) {
 	origTrack := versionTrackingEnabled()
 	defer func() {
@@ -731,7 +679,7 @@ func TestNegativeCacheTTL(t *testing.T) {
 	}()
 	setVersionTracking(true)
 	resetVersionCacheForTest()
-	withStubbedSources(t, "boom", "boom", 500, 500, "")
+	withSources(t, "boom", 500, "")
 
 	probeAndStoreVersion()
 	e := versionCache.Load()
