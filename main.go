@@ -194,11 +194,22 @@ func pluginLogf(format string, args ...any) {
 
 // -----------------------------------------------------------------------------
 
+// traeRegistrationOrFallback 返回注册响应。自检失败时绝不发出会被宿主拒收的
+// 空字段（宿主会静默丢弃整个插件），而是在插件侧记日志并降级处理。
+func traeRegistrationOrFallback() registration {
+	reg := traeRegistration()
+	if !validPluginMetadata(reg.Metadata) {
+		pluginLogf("registration metadata invalid (host would reject) — name=%q version=%q author=%q repo=%q",
+			reg.Metadata.Name, reg.Metadata.Version, reg.Metadata.Author, reg.Metadata.GitHubRepository)
+	}
+	return reg
+}
+
 func handleMethod(method string, request []byte) ([]byte, error) {
 	switch method {
 	case pluginabi.MethodPluginRegister, pluginabi.MethodPluginReconfigure:
 		configure(request)
-		return okEnvelope(traeRegistration())
+		return okEnvelope(traeRegistrationOrFallback())
 	case pluginabi.MethodModelStatic:
 		return handleModelStatic(request)
 	case pluginabi.MethodModelForAuth:
@@ -278,14 +289,29 @@ type registrationCapability struct {
 	UsagePlugin           bool                         `json:"usage_plugin"`
 }
 
+// validPluginMetadata 复刻宿主 internal/pluginhost/host.go:validPlugin 的校验：
+// Metadata 的 Name / Version / Author / GitHubRepository 四个字段都不能为空。
+// 宿主在 plugin.register 返回后立刻用这个规则过滤，任一为空就打
+// "pluginhost: plugin %s returned invalid metadata or no capabilities" 并拒绝注册。
+// 这里自检一遍，保证永远不把一个会被宿主拒收的 registration 发出去。
+func validPluginMetadata(m pluginapi.Metadata) bool {
+	return strings.TrimSpace(m.Name) != "" &&
+		strings.TrimSpace(m.Version) != "" &&
+		strings.TrimSpace(m.Author) != "" &&
+		strings.TrimSpace(m.GitHubRepository) != ""
+}
+
 func traeRegistration() registration {
 	return registration{
 		SchemaVersion: pluginabi.SchemaVersion,
 		Metadata: pluginapi.Metadata{
-			Name:             providerName,
-			Version:          version,
-			Author:           "traework2api migration",
-			GitHubRepository: "",
+			Name:    providerName,
+			Version: version,
+			Author:  "traework2api migration",
+			// GitHubRepository 必须非空：宿主 validPlugin() 要求
+			// Name/Version/Author/GitHubRepository 四个字段都非空，
+			// 否则打 "invalid metadata or no capabilities" 并拒绝注册。
+			GitHubRepository: "https://github.com/router-for-me/CLIProxyAPI",
 			Logo:             pluginLogoURL,
 			ConfigFields: []pluginapi.ConfigField{
 				{Name: "checkin_auto", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Enable daily auto check-in (default true)."},

@@ -787,3 +787,93 @@ func TestStripDataPrefix(t *testing.T) {
 		t.Errorf("got %q", got)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 宿主注册校验（回归测试：灰度挂载时宿主拒收的根因）
+// ---------------------------------------------------------------------------
+
+// TestValidPluginMetadata 复刻宿主 internal/pluginhost/host.go:validPlugin 对
+// Metadata 的要求：Name / Version / Author / GitHubRepository 四个字段都必须非空。
+// 任一项为空时宿主打 "invalid metadata or no capabilities" 并拒绝注册整个插件。
+//
+// 曾因 GitHubRepository:"" 被真实宿主拒收（workbuddy 有值所以正常），故固定下来。
+func TestValidPluginMetadata(t *testing.T) {
+	reg := traeRegistration()
+	if !validPluginMetadata(reg.Metadata) {
+		t.Fatalf("registration metadata would be rejected by the host: %+v", reg.Metadata)
+	}
+	fields := map[string]string{
+		"Name":             reg.Metadata.Name,
+		"Version":          reg.Metadata.Version,
+		"Author":           reg.Metadata.Author,
+		"GitHubRepository": reg.Metadata.GitHubRepository,
+	}
+	for name, v := range fields {
+		if strings.TrimSpace(v) == "" {
+			t.Errorf("metadata.%s is empty — host validPlugin() rejects this", name)
+		}
+	}
+}
+
+// TestValidPluginMetadataRejectsEmpty 逐字段验证自检能抓到空值。
+func TestValidPluginMetadataRejectsEmpty(t *testing.T) {
+	base := traeRegistration().Metadata
+	cases := []struct {
+		name   string
+		mutate func(*pluginapi.Metadata)
+	}{
+		{"empty name", func(m *pluginapi.Metadata) { m.Name = "" }},
+		{"blank version", func(m *pluginapi.Metadata) { m.Version = "   " }},
+		{"empty author", func(m *pluginapi.Metadata) { m.Author = "" }},
+		{"empty github repo", func(m *pluginapi.Metadata) { m.GitHubRepository = "" }},
+	}
+	for _, c := range cases {
+		m := base
+		c.mutate(&m)
+		if validPluginMetadata(m) {
+			t.Errorf("%s should be rejected", c.name)
+		}
+	}
+}
+
+// TestRegistrationDeclaresCapabilitiesAtLeastOne 宿主还要求至少一个 capability
+// 非 nil，否则同样判为 invalid。
+func TestRegistrationDeclaresCapabilitiesAtLeastOne(t *testing.T) {
+	reg := traeRegistration()
+	c := reg.Capabilities
+	if !c.ModelProvider && !c.AuthProvider && !c.Executor &&
+		!c.Scheduler && !c.ManagementAPI && !c.FrontendAuthProvider &&
+		!c.UsagePlugin {
+		t.Error("registration declares no capability — host validPlugin() rejects this")
+	}
+	// 本插件必须提供 executor，否则 chat 反代不可用
+	if !c.Executor {
+		t.Error("executor capability must be declared")
+	}
+}
+
+// TestRegistrationExecutorFormatsNonEmpty executor 声明了就必须给出格式列表。
+func TestRegistrationExecutorFormatsNonEmpty(t *testing.T) {
+	reg := traeRegistration()
+	if reg.Capabilities.Executor && len(reg.Capabilities.ExecutorInputFormats) == 0 {
+		t.Error("executor declared but no input formats")
+	}
+	if reg.Capabilities.Executor && len(reg.Capabilities.ExecutorOutputFormats) == 0 {
+		t.Error("executor declared but no output formats")
+	}
+}
+
+// TestRegistrationVersionNoLeadingV 宿主 pluginstore 用
+// ^[0-9][0-9A-Za-z.+-]*$ 校验版本号：不能以 v 开头，必须以数字开头。
+func TestRegistrationVersionNoLeadingV(t *testing.T) {
+	v := traeRegistration().Metadata.Version
+	if v == "" {
+		t.Fatal("version is empty")
+	}
+	if strings.HasPrefix(v, "v") {
+		t.Errorf("version %q must not start with 'v'", v)
+	}
+	if v[0] < '0' || v[0] > '9' {
+		t.Errorf("version %q must start with a digit", v)
+	}
+}
