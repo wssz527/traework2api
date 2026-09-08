@@ -45,7 +45,7 @@ c-shared **没有进程隔离**——一个 panic 会拖垮整个 CPA 进程（8
 **macOS 禁用 `host.http.do`**（nested-RPC 期间宿主栈移动会让响应指针悬空，workbuddy 在 `model.for_auth` 实测触发过）。全部上游调用走插件内 `net/http`，共享连接池：
 
 - `HTTP`：短 JSON 请求，120s 总超时
-- `StreamHTTP`：SSE 长流，无总超时，靠 `ResponseHeaderTimeout=120s` 兜首字节
+- `StreamHTTP`：SSE 长流，无总超时，靠 `ResponseHeaderTimeout=300s` 兜首字节（长上下文首包可能需 1-2 分钟）
 
 副作用：CPA request-log 不记录 Trae 的出站请求，排障靠 `host.log` 或面板。
 

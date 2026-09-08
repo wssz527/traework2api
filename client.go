@@ -109,7 +109,7 @@ func New() *Client {
 		MaxIdleConns:          100,
 		MaxIdleConnsPerHost:   20,
 		IdleConnTimeout:       90 * time.Second,
-		ResponseHeaderTimeout: 120 * time.Second, // 首字节兜底，不限制整流时长
+		ResponseHeaderTimeout: 300 * time.Second, // 首字节兜底，不限制整流时长；长上下文（数十万 token）首包可能需 1-2 分钟
 	}
 	return &Client{
 		HTTP:       &http.Client{Timeout: 120 * time.Second, Transport: tr},
