@@ -224,9 +224,7 @@ func TestModelForAuthExcludesDeprecated(t *testing.T) {
 			t.Errorf("deprecated model leaked: %s", m.ID)
 		}
 	}
-	dynamicModelsCache.Lock()
-	dynamicModelsCache.models = nil
-	dynamicModelsCache.Unlock()
+	dynamicModelsCache.Store(nil)
 }
 
 func TestFilterExcludedModelsDoesNotMutateCache(t *testing.T) {

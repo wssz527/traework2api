@@ -49,6 +49,14 @@
 
   <div class="row" id="stats"></div>
 
+  <div id="authBox" style="display:none;background:#fff;border:1px solid #e5e7eb;border-radius:8px;padding:10px 14px;margin-bottom:16px">
+    <div style="color:#6b7280;margin-bottom:8px">需要管理密钥（management key）才能访问账号数据。从 CPA 主面板嵌入时会自动获取，无需输入。错误密钥请勿连点，避免 IP 封禁。</div>
+    <div style="display:flex;gap:8px">
+      <input id="keyInput" type="password" placeholder="management key" style="flex:1;padding:6px 10px;border:1px solid #d1d5db;border-radius:6px;font-size:13px">
+      <button onclick="saveKey()">连接</button>
+    </div>
+  </div>
+
   <table>
     <thead>
       <tr><th>选中</th><th>昵称</th><th>UID</th><th>剩余积分</th><th>状态</th><th>操作</th></tr>
@@ -64,14 +72,107 @@
 // 管理接口前缀：宿主把插件路由挂在 /v0/management/plugins/<id> 下。
 var BASE = location.pathname.replace(/\/v0\/resource\/plugins\/trae.*$/, '') + '/v0/management/plugins/trae';
 
+/* ---------- management key acquisition (3 fallbacks, zero config) ----------
+   1) CPA main panel localStorage "cli-proxy-auth" (XOR+base64, same-origin
+      iframe embed) — same approach as cpa-plugin-key-policy.
+   2) ?key= URL param (cleaned from history after read, kept in sessionStorage).
+   3) Manual input (sessionStorage only, never persisted).
+*/
+var ENC_PREFIX = "enc::v1::";
+var SECRET_SALT = "cli-proxy-api-webui::secure-storage";
+var PANEL_STORE = "cli-proxy-auth";
+var SS_KEY = "trae-mgmt-key";
+
+function _enc(t){return new TextEncoder().encode(t)}
+function _dec(b){return new TextDecoder().decode(b)}
+function _keyBytes(){try{return _enc(SECRET_SALT+"|"+window.location.host+"|"+navigator.userAgent)}catch(e){return _enc(SECRET_SALT)}}
+function _xor(d,k){var r=new Uint8Array(d.length);for(var i=0;i<d.length;i++)r[i]=d[i]^k[i%k.length];return r}
+function _b64e(b){var s="";for(var i=0;i<b.length;i++)s+=String.fromCharCode(b[i]);return btoa(s)}
+function _b64d(s){var bin=atob(s);var b=new Uint8Array(bin.length);for(var i=0;i<bin.length;i++)b[i]=bin.charCodeAt(i);return b}
+function deobfuscate(p){if(!p||!p.startsWith(ENC_PREFIX))return p;try{return _dec(_xor(_b64d(p.slice(ENC_PREFIX.length)),_keyBytes()))}catch(e){return p}}
+function isEmbedded(){try{return window.self!==window.top}catch(e){return false}}
+
+function readPanelKey(){
+  if(!isEmbedded())return null;
+  var raw;try{raw=localStorage.getItem(PANEL_STORE)}catch(e){return null}
+  if(!raw)return null;
+  try{
+    var parsed=JSON.parse(deobfuscate(raw));
+    var st=(parsed&&parsed.state)||parsed||{};
+    return typeof st.managementKey==="string"&&st.managementKey?st.managementKey:null;
+  }catch(e){return null}
+}
+function readUrlKey(){
+  var m=new URLSearchParams(window.location.search).get("key");
+  if(m){history.replaceState(null,"",window.location.pathname)}
+  return m;
+}
+function getKey(){
+  return sessionStorage.getItem(SS_KEY)||readPanelKey()||readUrlKey();
+}
+function saveKey(){
+  var v=document.getElementById("keyInput").value.trim();
+  if(!v)return;
+  sessionStorage.setItem(SS_KEY,v);
+  document.getElementById("authBox").style.display="none";
+  load();
+}
+function showAuth(){document.getElementById("authBox").style.display="block";var i=document.getElementById("keyInput");i&&i.focus()}
+function authHeaders(k){return k?{"Authorization":"Bearer "+k}:{}}
+/* --------------------------------------------------------------------------- */
+
 function fmt(n) { return n === null || n === undefined ? '—' : String(n); }
 
+var authFailCount = 0;
+var authFailUntil = 0;
+
 async function call(path, method, body) {
+  var k = getKey();
+  if (!k) {
+    showAuth();
+    throw new Error('需要管理密钥');
+  }
+  if (Date.now() < authFailUntil) {
+    throw new Error('认证多次失败，请稍后重试（防 IP 封禁）');
+  }
   var res = await fetch(BASE + path, {
     method: method || 'GET',
-    headers: {'Content-Type': 'application/json'},
+    headers: Object.assign({'Content-Type': 'application/json'}, authHeaders(k)),
     body: body ? JSON.stringify(body) : undefined
   });
+  if (res.status === 401) {
+    authFailCount++;
+    sessionStorage.removeItem(SS_KEY);
+    showAuth();
+    if (authFailCount >= 3) {
+      authFailUntil = Date.now() + 60000;
+      authFailCount = 0;
+      throw new Error('认证多次失败，请检查管理密钥后 60s 再试');
+    }
+    throw new Error('management key 无效或缺失');
+  }
+  if (res.status === 403) {
+    authFailCount++;
+    var btxt = '';
+    try { btxt = await res.text(); } catch (e) {}
+    if (/IP banned|too many failed/i.test(btxt)) {
+      var waitMs = 60000;
+      var m = btxt.match(/(\d+)\s*m(?:in(?:ute)?s?)?\s*(\d+)\s*s/i) || btxt.match(/(\d+)\s*m/i);
+      if (m) {
+        var mins = parseInt(m[1], 10) || 0;
+        var secs = m[2] ? parseInt(m[2], 10) : 0;
+        waitMs = Math.min(Math.max((mins * 60 + secs) * 1000, 30000), 30 * 60 * 1000);
+      }
+      authFailUntil = Date.now() + waitMs;
+      throw new Error(btxt.trim() || 'IP 被封禁，请稍后再试');
+    }
+    if (authFailCount >= 3) {
+      authFailUntil = Date.now() + 60000;
+      authFailCount = 0;
+    }
+    throw new Error(btxt.trim() || '禁止访问 (403)');
+  }
+  authFailCount = 0;
   var text = await res.text();
   try { return JSON.parse(text); } catch (e) { return {raw: text}; }
 }

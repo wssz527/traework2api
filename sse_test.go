@@ -27,6 +27,32 @@ func TestPrepareBodyForcesStreamAndFunction(t *testing.T) {
 	}
 }
 
+func TestPrepareBodyForwardsReasoningEffort(t *testing.T) {
+	for _, v := range []string{"low", "medium", "high"} {
+		out := PrepareBody([]byte(`{"model":"glm-5.2","reasoning_effort":"` + v + `","messages":[{"role":"user","content":"hi"}]}`))
+		var m map[string]any
+		json.Unmarshal(out, &m)
+		if got, _ := m["reasoning_effort"].(string); got != v {
+			t.Errorf("reasoning_effort=%q want %q", got, v)
+		}
+	}
+}
+
+func TestPrepareBodyDropsEmptyReasoningEffort(t *testing.T) {
+	// 客户端未显式传 / 传空 → 不带上该字段（保守，避免给无需推理的模型误加）
+	for _, in := range []string{
+		`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`,
+		`{"model":"glm-5.2","reasoning_effort":"","messages":[{"role":"user","content":"hi"}]}`,
+	} {
+		out := PrepareBody([]byte(in))
+		var m map[string]any
+		json.Unmarshal(out, &m)
+		if _, present := m["reasoning_effort"]; present {
+			t.Errorf("reasoning_effort should be absent for input %s", in)
+		}
+	}
+}
+
 func TestPrepareBodyKeepsArrayContent(t *testing.T) {
 	out := PrepareBody([]byte(`{"model":"glm-5.2","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`))
 	var m map[string]any

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -76,31 +77,134 @@ func traeStaticModels() []pluginapi.ModelInfo {
 	return out
 }
 
-// dynamicModelsCacheTTL 缓存时长。model.static / model.for_auth 会被 CPA
-// 在每次 config reload 和每次 models 查询时重新调用；不缓存会导致每次 reload
-// 都扇出到每个账号一次上游调用。
-const dynamicModelsCacheTTL = 5 * time.Minute
+// ---------------------------------------------------------------------------
+// 动态模型表缓存（get_detail_param 上游源）。
+//
+// 模式参照 version.go：成功缓存 24h、失败负缓存 1h，后台刷新不阻塞请求链路。
+// model.static / model.for_auth 会被 CPA 在每次 config reload 和每次 models
+// 查询时重新调用——命中缓存直接返回，绝不扇出到每个账号一次上游调用。
+// ---------------------------------------------------------------------------
 
-var dynamicModelsCache struct {
-	sync.RWMutex
+const (
+	dynamicModelsSuccessTTL = 24 * time.Hour
+	dynamicModelsFailTTL    = 1 * time.Hour
+	modelsFetchTO           = 20 * time.Second
+)
+
+type dynamicModelsEntry struct {
 	models  []pluginapi.ModelInfo
 	fetched time.Time
+	ok      bool // false = 负缓存（上次拉取失败，占位用静态表）
 }
 
+// modelsAutoProbe 控制"无缓存时是否后台自动探测"。默认开启；单测关闭它以
+// 获得确定性（后台 goroutine 会在测试断言之间写缓存）。
+var modelsAutoProbe atomic.Bool
+
+var (
+	dynamicModelsCache atomic.Pointer[dynamicModelsEntry]
+	modelsMu           sync.Mutex // 串行化后台刷新，避免并发重复请求上游
+	dynamicModelsTrack atomic.Bool
+)
+
+func init() {
+	dynamicModelsTrack.Store(true)
+	modelsAutoProbe.Store(true)
+}
+
+func modelsTrackingEnabled() bool { return dynamicModelsTrack.Load() }
+
+func setModelsTracking(v bool) { dynamicModelsTrack.Store(v) }
+
+// cachedDynamicModels 返回有效缓存（命中即真）。负缓存未到期也视为"已尝试"
+// 命中（返回 ok=false + 静态表），不再重复探测。
 func cachedDynamicModels() ([]pluginapi.ModelInfo, bool) {
-	dynamicModelsCache.RLock()
-	defer dynamicModelsCache.RUnlock()
-	if len(dynamicModelsCache.models) > 0 && time.Since(dynamicModelsCache.fetched) < dynamicModelsCacheTTL {
-		return dynamicModelsCache.models, true
+	e := dynamicModelsCache.Load()
+	if e == nil {
+		return nil, false
+	}
+	if e.ok && time.Since(e.fetched) < dynamicModelsSuccessTTL {
+		return e.models, true
+	}
+	if !e.ok && time.Since(e.fetched) < dynamicModelsFailTTL {
+		return nil, true
 	}
 	return nil, false
 }
 
 func storeDynamicModels(models []pluginapi.ModelInfo) {
-	dynamicModelsCache.Lock()
-	dynamicModelsCache.models = models
-	dynamicModelsCache.fetched = time.Now()
-	dynamicModelsCache.Unlock()
+	dynamicModelsCache.Store(&dynamicModelsEntry{
+		models:  models,
+		fetched: time.Now(),
+		ok:      true,
+	})
+}
+
+// storeDynamicModelsFail 记录一次失败（负缓存）。
+func storeDynamicModelsFail() {
+	dynamicModelsCache.Store(&dynamicModelsEntry{
+		fetched: time.Now(),
+		ok:      false,
+	})
+}
+
+// fetchDynamicModels 从凭证拉模型表；优先返回动态缓存，内存态回退静态表。
+func fetchDynamicModels(sa *traeAuth) []pluginapi.ModelInfo {
+	if models, ok := cachedDynamicModels(); ok {
+		return models
+	}
+	if !modelsTrackingEnabled() {
+		return traeStaticModels()
+	}
+	if modelsAutoProbe.Load() {
+		go refreshDynamicModels(sa)
+	}
+	return traeStaticModels()
+}
+
+// refreshDynamicModels 后台探测并更新缓存；任何失败都静默回退（负缓存）。
+// 与 version.go 的 refreshUpstreamVersion 同样：无有效缓存才拉，串行化并发。
+func refreshDynamicModels(sa *traeAuth) {
+	defer func() {
+		if r := recover(); r != nil {
+			pluginLogf("panic in model refresh: %v", r)
+		}
+	}()
+	if !modelsTrackingEnabled() || sa == nil {
+		return
+	}
+	if _, ok := cachedDynamicModels(); ok {
+		return
+	}
+	if !modelsMu.TryLock() {
+		return
+	}
+	defer modelsMu.Unlock()
+	infos, err := currentClient().FetchModels(sa)
+	if err != nil || len(infos) == 0 {
+		pluginLogf("models fetch failed (negative cache): %v", err)
+		storeDynamicModelsFail()
+		return
+	}
+	out := modelsFromUpstream(infos)
+	if len(out) == 0 {
+		pluginLogf("models list empty after filter — keeping static")
+		storeDynamicModelsFail()
+		return
+	}
+	// 动态表为准，但动态表缺了静态表里的某个模型时记一条 warn（人还在用的
+	// 内部名不会凭空消失——已在用的人按动态表裁决，记录以便排查）。
+	have := make(map[string]bool, len(out))
+	for _, m := range out {
+		have[m.ID] = true
+	}
+	for _, id := range staticModelIDs {
+		if !have[id] && !deprecatedModelIDs[id] {
+			pluginLogf("WARN: model %q present in static table but absent from upstream model list — dynamic table wins", id)
+		}
+	}
+	storeDynamicModels(out)
+	pluginLogf("models synced from upstream: %d entries", len(out))
 }
 
 // modelAliasCache 反向别名表：宿主应用 oauth-model-alias 后，客户端可能用
@@ -314,26 +418,6 @@ func modelEntry(id, name string, ctx, input, output int64, maxMode, multimodal b
 	}
 	_ = maxMode
 	return m
-}
-
-// fetchDynamicModels 从凭证拉模型表；失败回退静态表。
-func fetchDynamicModels(sa *traeAuth) []pluginapi.ModelInfo {
-	if models, ok := cachedDynamicModels(); ok {
-		return models
-	}
-	if sa == nil {
-		return traeStaticModels()
-	}
-	infos, err := currentClient().FetchModels(sa)
-	if err != nil || len(infos) == 0 {
-		return traeStaticModels()
-	}
-	out := modelsFromUpstream(infos)
-	if len(out) == 0 {
-		return traeStaticModels()
-	}
-	storeDynamicModels(out)
-	return out
 }
 
 func handleModelStatic(raw []byte) ([]byte, error) {

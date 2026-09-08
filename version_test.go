@@ -695,5 +695,6 @@ func TestNegativeCacheTTL(t *testing.T) {
 // 改写缓存，导致偶发失败）。
 func TestMain(m *testing.M) {
 	versionAutoProbe.Store(false)
+	modelsAutoProbe.Store(false)
 	os.Exit(m.Run())
 }

@@ -100,6 +100,7 @@ func PrepareBody(src []byte) []byte {
 	obj["config_name"] = model
 	obj["model"] = model
 
+	forwardReasoningEffort(obj)
 	normalizeToolChoice(obj)
 	normalizeTools(obj)
 	out, err := json.Marshal(obj)
@@ -111,6 +112,23 @@ func PrepareBody(src []byte) []byte {
 
 // DefaultConfigName 默认模型（glm-5.2，实测可用）。
 const DefaultConfigName = "glm-5.2"
+
+// forwardReasoningEffort 把客户端传来的 reasoning_effort 透传给 SOLO 上游。
+// 保守处理：只在客户端显式传了非空值时转发（避免给无需推理的模型误加字段），
+// 取值按上游 reasoning_effort_config.options 原样透传（low/medium/high 等）。
+func forwardReasoningEffort(obj map[string]any) {
+	v, ok := obj["reasoning_effort"].(string)
+	if !ok {
+		delete(obj, "reasoning_effort")
+		return
+	}
+	v = strings.TrimSpace(v)
+	if v == "" {
+		delete(obj, "reasoning_effort")
+		return
+	}
+	obj["reasoning_effort"] = v
+}
 
 // normalizeToolChoice 按上游 Go struct（string 类型）改写 OpenAI tool_choice。
 func normalizeToolChoice(obj map[string]any) {
