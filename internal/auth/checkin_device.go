@@ -1,15 +1,22 @@
-// checkin_device.go 本机签到设备标识自动读取。
+// checkin_device.go 本机签到设备标识自动读取与每账号独立伪造。
 //
 // 签到接口（/ug/checkin_credits/*）要求请求头带独立设备三件套
 // （x-device-id / x-device-brand / x-device-type），且与模型通道的
 // machineId/deviceId 不同。官方客户端（TRAE SOLO CN）把该设备 ID 以
 // "user_unique_id":"<16位数字>" 明文保存在 Chromium Local Storage
 // leveldb 里（mitm 抓包确认：leveldb 中的值与签到请求 x-device-id
-// 完全一致）。本文件负责在凭证缺少 checkinDeviceId 时从本机官方客户端
-// 自动读取，避免用户手工折腾；读取失败时由调用方明确报错并提示手动获取。
+// 完全一致）。
+//
+// 多账号场景：若所有账号都从本机官方客户端读取到同一个设备 ID，
+// 上游按（账号,设备）维度记录签到，共用 ID 会导致只有第一个账号能签成、
+// 其余报 9095。因此本文件同时提供伪造设备三件套生成：
+// 每个账号分配一个固定的 16 位数字 ID（与官方 user_unique_id 同构，
+// brand/type 取本机真实机型），生成一次后写回凭证长期复用，不随重启变化。
 package auth
 
 import (
+	"crypto/rand"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,6 +24,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"time"
 )
 
 // userUniqueIDRe 匹配 leveldb 日志中的设备 ID 明文（10~20 位纯数字）。
@@ -144,4 +152,82 @@ func detectBrandWindows() string {
 		return ""
 	}
 	return strings.TrimSpace(string(out))
+}
+
+// fakeDeviceIDRe 校验既有签到设备 ID 是否为"本文件生成的伪造 ID"：
+// 16 位纯数字。官方 user_unique_id 也是 16 位数字，二者同构——该判断
+// 仅用于决定是否迁移（共用本机探测 ID 的旧账号），不区分来源。
+var fakeDeviceIDRe = regexp.MustCompile(`^\d{16}$`)
+
+// newFakeCheckinID 生成一个 16 位纯数字设备 ID（与官方 user_unique_id
+// 同构，实测纯数字 16 位可正常签到；hex 含字母的设备 ID 触发上游风控 9074）。
+// 用 crypto/rand 逐字节取 0-9，避免 math/rand 种子可预测导致多账号 ID 相关。
+func newFakeCheckinID() string {
+	const digits = "0123456789"
+	var b [16]byte
+	rb := make([]byte, 16)
+	if _, err := rand.Read(rb); err == nil {
+		for i := range b {
+			b[i] = digits[int(rb[i])%10]
+		}
+		return string(b[:])
+	}
+	// crypto/rand 失败（极罕见）：退回时间戳派生，仍保证 16 位数字
+	return fmt.Sprintf("%016d", time.Now().UnixNano()%1e16)
+}
+
+// localBrandType 返回本机品牌与类型（尽力探测，与官方客户端一致）。
+// 失败时回退通用值：brand 为空串、type 按 OS。空 brand 实测不影响签到
+// （上游以 device-id 为准），但尽量带上真实机型更接近官方形态。
+func localBrandType() (brand, typ string) {
+	switch runtime.GOOS {
+	case "darwin":
+		typ = "mac"
+		brand = detectBrandDarwin()
+	case "windows":
+		typ = "windows"
+		brand = detectBrandWindows()
+	default:
+		typ = "unknown"
+	}
+	return brand, typ
+}
+
+// EnsurePerAccountCheckinDevice 为账号确保一个固定的、独立于其它账号的
+// 签到设备三件套。规则：
+//
+//  1. 凭证已有签到设备 ID 且不是本机探测的共用 ID（见 DetectLocalCheckinDevice
+//     的返回）→ 视为已固定，原样保留不动（历史账号维持稳定，避免频繁换设备
+//     触发风控）。
+//  2. 凭证缺 ID，或 ID 等于本机官方客户端探测到的共用 ID（多账号撞同一设备
+//     → 上游只让第一个签成）→ 生成新的固定伪造 ID（16 位数字 + 本机
+//     brand/type），写回凭证。
+//
+// 返回是否写入了新设备标识（调用方据此 SaveAtomic）。
+func EnsurePerAccountCheckinDevice(a *Auth) (changed bool) {
+	if a.CheckinDeviceID != "" {
+		// 已有 ID：仅当它与本机探测的共用 ID 相同（多账号撞车）才需要迁移。
+		if localID, _, _, ok := DetectLocalCheckinDevice(); ok && a.CheckinDeviceID == localID {
+			// 撞车：迁移到独立伪造 ID（保留原 brand/type 风格）
+			a.CheckinDeviceID = newFakeCheckinID()
+			if a.CheckinDeviceBrand == "" {
+				if brand, _ := localBrandType(); brand != "" {
+					a.CheckinDeviceBrand = brand
+				}
+			}
+			if a.CheckinDeviceType == "" {
+				_, typ := localBrandType()
+				a.CheckinDeviceType = typ
+			}
+			return true
+		}
+		return false // 已有独立/真实 ID，保持不动
+	}
+
+	// 无 ID：生成固定伪造 ID（不再探测共用本机 ID）
+	brand, typ := localBrandType()
+	a.CheckinDeviceID = newFakeCheckinID()
+	a.CheckinDeviceBrand = brand
+	a.CheckinDeviceType = typ
+	return true
 }

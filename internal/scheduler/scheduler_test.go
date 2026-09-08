@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -152,9 +153,10 @@ func TestRunCheckinDoesNotLogSuccessWhenStatusDoesNotChange(t *testing.T) {
 
 // 凭证缺 checkinDeviceId 且无法从本机官方客户端自动读取时，
 // 必须跳过签到并打印明确提示，不发无设备头的无效请求，也不生成随机假 ID。
-func TestRunCheckinSkipsMissingCheckinDeviceID(t *testing.T) {
+func TestRunCheckinGeneratesDeviceIDWhenMissing(t *testing.T) {
+	// 缺签到设备 ID 的账号：应自动生成独立伪造设备 ID 并正常签到（不再跳过）。
 	t.Setenv("TW2A_DISABLE_CHECKIN_DETECT", "1") // 隔离本机官方客户端数据，保持用例 hermetic
-	f := &fakeUpstream{resourceRemain: 500}
+	f := &fakeUpstream{resourceRemain: 500, verifyChecked: true}
 	srv := f.server()
 	defer srv.Close()
 
@@ -168,12 +170,22 @@ func TestRunCheckinSkipsMissingCheckinDeviceID(t *testing.T) {
 
 	s := newTestScheduler(f, p, srv)
 	s.RunCheckinNow()
-	if f.checkinCalls.Load() != 0 || f.claimCalls.Load() != 0 {
-		t.Errorf("no upstream checkin calls expected, status=%d claim=%d",
+
+	// status(未签→claim) + verify status = 2 次 status、1 次 claim
+	if f.checkinCalls.Load() != 2 || f.claimCalls.Load() != 1 {
+		t.Errorf("unexpected upstream calls, status=%d claim=%d (want 2/1)",
 			f.checkinCalls.Load(), f.claimCalls.Load())
 	}
-	if !strings.Contains(logs.String(), "缺签到设备ID") {
-		t.Fatalf("missing skip hint: %s", logs.String())
+	// 账号应已获得 16 位数字伪造设备 ID 并写回
+	a := p.AuthByUID("u1")
+	if a == nil || a.CheckinDeviceID == "" {
+		t.Fatalf("account should have generated checkin device id, got: %+v", a)
+	}
+	if !regexp.MustCompile(`^\d{16}$`).MatchString(a.CheckinDeviceID) {
+		t.Errorf("generated device id should be 16 digits, got %q", a.CheckinDeviceID)
+	}
+	if !strings.Contains(logs.String(), "checkin u1: ok") {
+		t.Errorf("missing success log: %s", logs.String())
 	}
 }
 

@@ -99,23 +99,20 @@ func (s *Scheduler) RunCheckinNow() {
 			continue
 		}
 		// 签到（status → 未签到则 claim）
-		if a.CheckinDeviceID == "" {
-			// 凭证缺独立签到设备标识时，尝试从本机已登录的官方客户端自动读取
-			// 并写回凭证（Docker 容器内读不到宿主机客户端数据，会走到下面的跳过分支）。
-			if id, brand, typ, ok := auth.DetectLocalCheckinDevice(); ok {
-				a.CheckinDeviceID, a.CheckinDeviceBrand, a.CheckinDeviceType = id, brand, typ
-				if err := a.SaveAtomic(); err != nil {
-					log.Printf("checkin %s: 自动读取签到设备ID成功但写回失败: %v", st.UID, err)
-				} else {
-					log.Printf("checkin %s: 已从本机官方客户端自动读取签到设备ID并写回凭证", st.UID)
-				}
+		// 每账号独立固定设备 ID：新账号自动生成伪造设备 ID（16 位数字 +
+		// 本机机型），已固定的保持不动；与其它账号共用本机探测 ID 的迁移为
+		// 独立 ID。生成一次写回凭证，之后长期复用，避免多账号撞同一设备
+		// 导致只有第一个能签成、也避免频繁更换设备触发风控。
+		if auth.EnsurePerAccountCheckinDevice(a) {
+			if err := a.SaveAtomic(); err != nil {
+				log.Printf("checkin %s: 生成独立签到设备ID成功但写回失败: %v", st.UID, err)
+			} else {
+				log.Printf("checkin %s: 已生成独立签到设备ID并写回凭证 (device=%s...)", st.UID, a.CheckinDeviceID[:8])
 			}
 		}
 		if a.CheckinDeviceID == "" {
-			// 凭证缺少独立签到设备标识且本机检测不到官方客户端：多账号签到
-			// 要求各账号使用不同的设备 ID，缺字段时明确跳过并说明，不发无设备头
-			// 的无效请求，也不生成随机假 ID（上游无法识别，签到永远不会生效）。
-			log.Printf("checkin %s: skip, 缺签到设备ID且本机未检测到官方客户端（在已登录官方客户端的机器上跑 signin.sh 可自动读取并写回凭证；手动获取见 README「签到设备ID」）", st.UID)
+			// 生成失败（理论上 Ensure 总会给 ID，此处兜底）
+			log.Printf("checkin %s: skip, 签到设备ID为空", st.UID)
 		} else {
 			checkedIn, _, enable, err := s.cfg.Upstream.CheckinStatus(a)
 			if err != nil {

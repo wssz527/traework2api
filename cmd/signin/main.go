@@ -37,19 +37,6 @@ func main() {
 	sort.Strings(files)
 	up := upstream.New()
 
-	// 本机官方客户端签到设备标识，懒探测一次，全账号复用。
-	var (
-		detOnce               bool
-		detID, detBrand, detT string
-		detOK                 bool
-	)
-	detect := func() bool {
-		if !detOnce {
-			detID, detBrand, detT, detOK = auth.DetectLocalCheckinDevice()
-			detOnce = true
-		}
-		return detOK
-	}
 	var notes []string
 	idUsers := map[string][]string{} // 签到设备ID → 使用该ID的账号（查多账号共用）
 
@@ -90,24 +77,17 @@ func main() {
 			_ = a.SaveAtomic()
 		}
 
-		// 签到
-		if a.CheckinDeviceID == "" && detect() {
-			// 凭证缺独立签到设备标识时，从本机已登录的官方客户端自动读取，
-			// 并写回凭证文件（容器内 scheduler 读不到本机客户端数据，靠落盘共享）。
-			a.CheckinDeviceID, a.CheckinDeviceBrand, a.CheckinDeviceType = detID, detBrand, detT
+		// 签到：每账号独立固定设备 ID（新账号自动伪造、共用迁移、已固定不动）
+		if auth.EnsurePerAccountCheckinDevice(a) {
 			if err := a.SaveAtomic(); err != nil {
-				notes = append(notes, fmt.Sprintf("%s: 自动读取签到设备ID成功但写回凭证失败: %v", r.uid, err))
+				notes = append(notes, fmt.Sprintf("%s: 生成独立签到设备ID成功但写回凭证失败: %v", r.uid, err))
 			} else {
-				notes = append(notes, fmt.Sprintf("%s: 已从本机官方客户端自动读取签到设备ID并写回凭证", r.uid))
+				notes = append(notes, fmt.Sprintf("%s: 已生成独立签到设备ID并写回凭证", r.uid))
 			}
 		}
 		if a.CheckinDeviceID == "" {
-			// 凭证缺少独立签到设备标识：签到请求必须带与模型通道不同的
-			// 设备标识，且多账号之间必须各不相同（相同会被上游关联）。
-			// 这里明确报 FAIL 并说明原因，不发无设备头的无效请求，
-			// 也不生成随机假 ID（上游无法识别，签到永远不会生效）。
 			r.status = "FAIL"
-			r.detail = "缺签到设备ID且本机未检测到官方客户端，无法自动读取；手动获取见 README「签到设备ID」"
+			r.detail = "签到设备ID为空"
 			failN++
 		} else {
 			idUsers[a.CheckinDeviceID] = append(idUsers[a.CheckinDeviceID], r.uid)
