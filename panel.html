@@ -1,115 +1,180 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Trae · CPA 插件面板</title>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trae 面板</title>
 <style>
-  :root { color-scheme: light dark; }
-  body { margin:0; font:14px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",Arial,sans-serif;
-         background:#f6f7f9; color:#1c1e21; }
-  .wrap { max-width: 960px; margin:0 auto; padding:24px 16px 64px; }
-  h1 { font-size:20px; margin:0 0 4px; }
-  .sub { color:#6b7280; font-size:12px; margin-bottom:20px; }
-  .bar { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:16px; }
-  button { padding:6px 14px; border:1px solid #d1d5db; border-radius:6px; background:#fff;
-           color:#1c1e21; cursor:pointer; font-size:13px; }
-  button:hover { background:#f3f4f6; }
-  button:disabled { opacity:.5; cursor:default; }
-  table { width:100%; border-collapse:collapse; background:#fff; border:1px solid #e5e7eb; border-radius:8px; overflow:hidden; }
-  th, td { padding:8px 10px; text-align:left; border-bottom:1px solid #f0f1f3; font-size:13px; }
-  th { background:#fafbfc; font-weight:600; color:#4b5563; }
-  tr:last-child td { border-bottom:none; }
-  .sel { background:#eff6ff; }
-  .badge { display:inline-block; padding:1px 7px; border-radius:10px; font-size:11px; }
-  .b-ok { background:#dcfce7; color:#166534; }
-  .b-warn { background:#fef3c7; color:#92400e; }
-  .b-off { background:#f3f4f6; color:#6b7280; }
-  .err { color:#b91c1c; }
-  pre { background:#fff; border:1px solid #e5e7eb; border-radius:8px; padding:12px; overflow:auto;
-        max-height:320px; font-size:12px; }
-  .muted { color:#6b7280; }
-  .row { display:flex; gap:16px; flex-wrap:wrap; margin-bottom:12px; }
-  .stat { background:#fff; border:1px solid #e5e7eb; border-radius:8px; padding:10px 14px; min-width:120px; }
-  .stat b { display:block; font-size:18px; }
-  .stat span { font-size:11px; color:#6b7280; }
+/* Theme tokens aligned with CPA management panel. */
+:root{
+  --bg:#faf9f5;--card:#ffffff;--border:#e3e1db;--fg:#2d2a26;--mut:#6d6760;
+  --acc:#4c8dff;--on-acc:#ffffff;--ok:#10b981;--warn:#e0aa14;--err:#c65746;
+  --surface:#f0eee8;--surface-muted:#e9e6df;--btn-sec:#eef1f6;--btn-sec-hover:#e4e8ef;
+  --input-bg:#ffffff;--code-bg:#f3f4f6;--code-fg:#374151;--placeholder:rgba(109,103,96,.55);
+  --ok-soft:rgba(16,185,129,.10);--ok-border:rgba(16,185,129,.30);
+  --warn-soft:rgba(224,170,20,.12);--warn-border:rgba(224,170,20,.32);
+  --err-soft:rgba(198,87,70,.10);--err-border:rgba(198,87,70,.30);
+  --mut-soft:rgba(109,103,96,.12);--mut-border:rgba(109,103,96,.28);
+  --scrim:rgba(45,42,38,.35);--toast-shadow:0 10px 28px rgba(0,0,0,.12),0 0 0 1px rgba(0,0,0,.04);
+  --acc-ring:rgba(76,141,255,.18);--radius-md:12px;--radius-lg:16px;
+  color-scheme:light
+}
+:root[data-theme="dark"]{
+  --bg:#1e1d1b;--card:#26241f;--border:#3a3833;--fg:#ede9e3;--mut:#9a948c;
+  --acc:#4c8dff;--on-acc:#ffffff;--ok:#34d399;--warn:#f0c050;--err:#e07a6a;
+  --surface:#2f2d28;--surface-muted:#35332e;--btn-sec:#35332e;--btn-sec-hover:#3f3c36;
+  --input-bg:#1e1d1b;--code-bg:#35332e;--code-fg:#d6d1c9;--placeholder:rgba(154,148,140,.55);
+  --ok-soft:rgba(52,211,153,.12);--ok-border:rgba(52,211,153,.38);
+  --warn-soft:rgba(240,192,80,.14);--warn-border:rgba(240,192,80,.38);
+  --err-soft:rgba(224,122,106,.12);--err-border:rgba(224,122,106,.38);
+  --mut-soft:rgba(154,148,140,.16);--mut-border:rgba(154,148,140,.32);
+  --scrim:rgba(0,0,0,.55);--toast-shadow:0 10px 28px rgba(0,0,0,.55),0 0 0 1px rgba(255,255,255,.03);
+  --acc-ring:rgba(76,141,255,.28);
+  color-scheme:dark
+}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif}
+.wrap{max-width:1100px;margin:0 auto;padding:24px 16px}
+h1{font-size:20px;margin:0 0 4px}.sub{color:var(--mut);font-size:13px;margin-bottom:20px}
+.bar{display:flex;gap:8px;align-items:center;margin-bottom:16px;flex-wrap:wrap}
+button{background:var(--acc);color:var(--on-acc);border:0;border-radius:8px;padding:8px 14px;cursor:pointer;font-size:13px}
+button.sec{background:var(--btn-sec);color:var(--fg)}button.sec:hover{background:var(--btn-sec-hover)}button:disabled{opacity:.5;cursor:default}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:14px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px}
+.card.selected{border-color:var(--acc);box-shadow:0 0 0 2px var(--acc-ring)}
+.card h2{font-size:15px;margin:0 0 2px;display:flex;justify-content:space-between;align-items:center}
+.uid{color:var(--mut);font-size:11px;font-family:ui-monospace,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-bottom:12px}
+.badge{font-size:11px;font-weight:600;padding:3px 10px;border-radius:99px;background:var(--ok-soft);color:var(--ok);border:1px solid var(--ok-border)}
+.badge.active{background:var(--acc-ring);color:var(--acc);border-color:var(--acc)}
+.badge.cooling{background:var(--warn-soft);color:var(--warn);border:1px solid var(--warn-border)}
+.badge.disabled{background:var(--mut-soft);color:var(--mut);border:1px solid var(--mut-border)}
+.badge.err{background:var(--err-soft);color:var(--err);border:1px solid var(--err-border)}
+.rows{background:var(--card);border:1px solid var(--border);border-radius:12px;overflow:hidden}
+table{width:100%;border-collapse:collapse}
+th,td{padding:11px 14px;text-align:left;border-bottom:1px solid var(--border);font-size:13px}
+th{color:var(--mut);font-weight:600;background:var(--surface);font-size:12px}
+tr:last-child td{border-bottom:none}
+tr.sel{background:var(--acc-ring)}
+.err{color:var(--err)}
+.muted{color:var(--mut)}
+.summary{margin-bottom:14px}
+.summary-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px}
+.summary-item{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px 14px}
+.summary-item .k{color:var(--mut);font-size:11px;margin-bottom:4px}
+.summary-item .v{font-size:20px;font-weight:700}
+.summary-item .v.ok{color:var(--ok)}.summary-item .v.warn{color:var(--warn)}.summary-item .v.err{color:var(--err)}
+.statusbox{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:14px 16px;margin-bottom:16px;font-size:13px}
+.statusbox .k{color:var(--mut);display:inline-block;min-width:64px}
+.statusbox code{background:var(--code-bg);color:var(--code-fg);padding:1px 6px;border-radius:5px;font-size:12px}
+.field-input{flex:1;background:var(--input-bg);border:1px solid var(--border);border-radius:8px;padding:8px 12px;color:var(--fg)}
+.toasts{position:fixed;top:16px;right:16px;display:flex;flex-direction:column;gap:10px;z-index:9999;max-width:360px}
+.toast{background:var(--card);border:1px solid var(--border);border-left:4px solid var(--acc);border-radius:var(--radius-md);padding:14px 18px;font-size:13px;box-shadow:var(--toast-shadow);transform:translateX(120%);opacity:0;transition:transform .3s cubic-bezier(.2,.9,.3,1.1),opacity .25s;cursor:pointer;word-break:break-all}
+.toast.show{transform:translateX(0);opacity:1}
+.toast.ok{border-left-color:var(--ok);background:var(--ok-soft)}
+.toast.warn{border-left-color:var(--warn);background:var(--warn-soft)}
+.toast.err{border-left-color:var(--err);background:var(--err-soft)}
+button.done{background:var(--ok-soft);color:var(--ok);border:1px solid var(--ok-border);cursor:default;opacity:1}
+button.done:disabled{opacity:1}
+.toast .t{font-weight:600;margin-bottom:3px}
+.toast .d{color:var(--mut);font-size:12px;line-height:1.45}
+.spin{display:inline-block;width:12px;height:12px;border:2px solid var(--on-acc);border-top-color:transparent;border-radius:50%;animation:sp .7s linear infinite;vertical-align:-2px;margin-right:6px}
+@keyframes sp{to{transform:rotate(360deg)}}
+button .spin{border-color:var(--on-acc);border-top-color:transparent}
+.loading{color:var(--mut);text-align:center;padding:40px}
 </style>
+<script>
+/* Early theme sync (mirror CPA parent data-theme when embedded). */
+(function(){
+  var ATTR="data-theme";
+  function embedded(){try{return window.self!==window.top}catch(e){return false}}
+  function apply(t){
+    var el=document.documentElement;
+    if(t==="dark")el.setAttribute(ATTR,t);else el.removeAttribute(ATTR);
+  }
+  function parentTheme(){
+    if(!embedded())return null;
+    try{
+      var raw=window.parent.document.documentElement.getAttribute(ATTR);
+      if(raw==="dark")return "dark";
+      return "light";
+    }catch(e){return null}
+  }
+  function systemTheme(){
+    try{return window.matchMedia&&window.matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light"}catch(e){return "light"}
+  }
+  function sync(){apply(parentTheme()||systemTheme())}
+  sync();
+  window.__traeThemeSync=function(){
+    sync();
+    if(!embedded()){
+      try{var mq=window.matchMedia("(prefers-color-scheme: dark)");var on=function(){sync()};if(mq.addEventListener)mq.addEventListener("change",on);else if(mq.addListener)mq.addListener(on)}catch(e){}
+      return;
+    }
+    try{
+      var parentEl=window.parent.document.documentElement;
+      new MutationObserver(sync).observe(parentEl,{attributes:true,attributeFilter:[ATTR]});
+      window.addEventListener("storage",function(e){if(e.key==="cli-proxy-theme")sync()});
+    }catch(e){}
+  };
+})();
+</script>
 </head>
 <body>
 <div class="wrap">
-  <h1>Trae · CLIProxyAPI 插件</h1>
-  <div class="sub" id="meta">加载中…</div>
+  <h1>Trae 账号面板</h1>
+  <div class="sub">账号积分 · 每日签到 · Token 刷新 · 版本自动跟踪</div>
 
-  <div class="bar">
-    <button onclick="act('/checkin','POST',{})">全量签到</button>
-    <button onclick="act('/refresh','POST',{})">刷新积分</button>
-    <button onclick="act('/keepalive','POST',{})">刷新 Token</button>
-    <button onclick="load()">重新加载</button>
-  </div>
-
-  <div class="row" id="stats"></div>
-
-  <div id="authBox" style="display:none;background:#fff;border:1px solid #e5e7eb;border-radius:8px;padding:10px 14px;margin-bottom:16px">
-    <div style="color:#6b7280;margin-bottom:8px">需要管理密钥（management key）才能访问账号数据。从 CPA 主面板嵌入时会自动获取，无需输入。错误密钥请勿连点，避免 IP 封禁。</div>
+  <!-- Management key acquisition (3 fallbacks) -->
+  <div id="authBox" style="display:none;background:var(--card);border:1px solid var(--border);border-radius:12px;padding:14px 16px;margin-bottom:16px">
+    <div style="color:var(--mut);margin-bottom:8px">需要管理密钥才能访问账号数据。从 CPA 主面板嵌入时会自动获取，无需输入。错误密钥请勿连点，避免 IP 封禁。</div>
     <div style="display:flex;gap:8px">
-      <input id="keyInput" type="password" placeholder="management key" style="flex:1;padding:6px 10px;border:1px solid #d1d5db;border-radius:6px;font-size:13px">
+      <input id="keyInput" type="password" placeholder="management key" class="field-input">
       <button onclick="saveKey()">连接</button>
     </div>
   </div>
 
-  <table>
-    <thead>
-      <tr><th>选中</th><th>昵称</th><th>UID</th><th>剩余积分</th><th>状态</th><th>操作</th></tr>
-    </thead>
-    <tbody id="rows"><tr><td colspan="6" class="muted">加载中…</td></tr></tbody>
-  </table>
+  <div class="bar">
+    <button onclick="checkinAll(this)">全量签到</button>
+    <button class="sec" onclick="refreshCredits(this)">刷新积分</button>
+    <button class="sec" onclick="keepaliveAll(this)">刷新 Token</button>
+    <button class="sec" onclick="load(this)">重新加载</button>
+  </div>
+
+  <div class="statusbox" id="status"></div>
+  <div class="summary-grid summary" id="summary"></div>
+
+  <div class="rows">
+    <table>
+      <thead><tr><th>选中</th><th>账号</th><th>UID</th><th>剩余积分</th><th>状态</th><th>操作</th></tr></thead>
+      <tbody id="rows"><tr><td colspan="6" class="loading">加载中…</td></tr></tbody>
+    </table>
+  </div>
 
   <h2 style="font-size:15px;margin:24px 0 8px">最近一次响应</h2>
-  <pre id="out">—</pre>
+  <pre id="out" style="background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px;overflow:auto;max-height:280px;font-size:12px;color:var(--mut)">—</pre>
 </div>
+<div class="toasts" id="toasts"></div>
 
 <script>
-// 管理接口前缀：宿主把插件路由挂在 /v0/management/plugins/<id> 下。
-var BASE = location.pathname.replace(/\/v0\/resource\/plugins\/trae.*$/, '') + '/v0/management/plugins/trae';
-
-/* ---------- management key acquisition (3 fallbacks, zero config) ----------
-   1) CPA main panel localStorage "cli-proxy-auth" (XOR+base64, same-origin
-      iframe embed) — same approach as cpa-plugin-key-policy.
-   2) ?key= URL param (cleaned from history after read, kept in sessionStorage).
-   3) Manual input (sessionStorage only, never persisted).
-*/
-var ENC_PREFIX = "enc::v1::";
-var SECRET_SALT = "cli-proxy-api-webui::secure-storage";
-var PANEL_STORE = "cli-proxy-auth";
-var SS_KEY = "trae-mgmt-key";
-
+/* Management key acquisition (3 fallbacks, zero config) */
+var ENC_PREFIX="enc::v1::";
+var SECRET_SALT="cli-proxy-api-webui::secure-storage";
+var PANEL_STORE="cli-proxy-auth";
+var SS_KEY="trae-mgmt-key";
 function _enc(t){return new TextEncoder().encode(t)}
 function _dec(b){return new TextDecoder().decode(b)}
 function _keyBytes(){try{return _enc(SECRET_SALT+"|"+window.location.host+"|"+navigator.userAgent)}catch(e){return _enc(SECRET_SALT)}}
 function _xor(d,k){var r=new Uint8Array(d.length);for(var i=0;i<d.length;i++)r[i]=d[i]^k[i%k.length];return r}
-function _b64e(b){var s="";for(var i=0;i<b.length;i++)s+=String.fromCharCode(b[i]);return btoa(s)}
 function _b64d(s){var bin=atob(s);var b=new Uint8Array(bin.length);for(var i=0;i<bin.length;i++)b[i]=bin.charCodeAt(i);return b}
 function deobfuscate(p){if(!p||!p.startsWith(ENC_PREFIX))return p;try{return _dec(_xor(_b64d(p.slice(ENC_PREFIX.length)),_keyBytes()))}catch(e){return p}}
 function isEmbedded(){try{return window.self!==window.top}catch(e){return false}}
-
 function readPanelKey(){
   if(!isEmbedded())return null;
   var raw;try{raw=localStorage.getItem(PANEL_STORE)}catch(e){return null}
   if(!raw)return null;
-  try{
-    var parsed=JSON.parse(deobfuscate(raw));
-    var st=(parsed&&parsed.state)||parsed||{};
-    return typeof st.managementKey==="string"&&st.managementKey?st.managementKey:null;
-  }catch(e){return null}
+  try{var parsed=JSON.parse(deobfuscate(raw));var st=(parsed&&parsed.state)||parsed||{};return typeof st.managementKey==="string"&&st.managementKey?st.managementKey:null}catch(e){return null}
 }
-function readUrlKey(){
-  var m=new URLSearchParams(window.location.search).get("key");
-  if(m){history.replaceState(null,"",window.location.pathname)}
-  return m;
-}
-function getKey(){
-  return sessionStorage.getItem(SS_KEY)||readPanelKey()||readUrlKey();
-}
+function readUrlKey(){var m=new URLSearchParams(window.location.search).get("key");if(m){history.replaceState(null,"",window.location.pathname)}return m;}
+function getKey(){return sessionStorage.getItem(SS_KEY)||readPanelKey()||readUrlKey()}
 function saveKey(){
   var v=document.getElementById("keyInput").value.trim();
   if(!v)return;
@@ -121,113 +186,124 @@ function showAuth(){document.getElementById("authBox").style.display="block";var
 function authHeaders(k){return k?{"Authorization":"Bearer "+k}:{}}
 /* --------------------------------------------------------------------------- */
 
-function fmt(n) { return n === null || n === undefined ? '—' : String(n); }
+/* Toast + busy helpers */
+function toast(title,kind,detail){
+  kind=kind||"ok";
+  var box=document.getElementById("toasts");
+  var el=document.createElement("div");
+  el.className="toast "+kind;
+  el.innerHTML='<div class="t">'+title+'</div>'+(detail?'<div class="d">'+detail+'</div>':'');
+  box.appendChild(el);
+  requestAnimationFrame(()=>requestAnimationFrame(()=>el.classList.add("show")));
+  var kill=()=>{el.classList.remove("show");setTimeout(()=>el.remove(),300)};
+  el.onclick=kill;
+  setTimeout(kill,kind==="err"?6000:4000);
+  while(box.children.length>5)box.firstChild.remove();
+}
+function busy(btn,on){
+  if(!btn)return;
+  if(on){btn.dataset.orig=btn.innerHTML;btn.disabled=true;btn.innerHTML='<span class="spin"></span>处理中…'}
+  else{btn.disabled=false;if(btn.dataset.orig)btn.innerHTML=btn.dataset.orig}
+}
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
+function fmt(n){return (n===null||n===undefined)?'—':String(n)}
+/* --------------------------------------------------------------------------- */
 
-var authFailCount = 0;
-var authFailUntil = 0;
+var BASE = location.pathname.replace(/\/v0\/resource\/plugins\/trae.*$/, '') + '/v0/management/plugins/trae';
+var lastAccounts = [];
 
-async function call(path, method, body) {
-  var k = getKey();
-  if (!k) {
-    showAuth();
-    throw new Error('需要管理密钥');
-  }
-  if (Date.now() < authFailUntil) {
-    throw new Error('认证多次失败，请稍后重试（防 IP 封禁）');
-  }
-  var res = await fetch(BASE + path, {
-    method: method || 'GET',
-    headers: Object.assign({'Content-Type': 'application/json'}, authHeaders(k)),
-    body: body ? JSON.stringify(body) : undefined
+var authFailCount=0, authFailUntil=0;
+
+async function call(path,method,body){
+  var k=getKey();
+  if(!k){showAuth();throw new Error('需要管理密钥')}
+  if(Date.now()<authFailUntil)throw new Error('认证多次失败，请稍后重试（防 IP 封禁）');
+  var res=await fetch(BASE+path,{
+    method:method||'GET',
+    headers:Object.assign({'Content-Type':'application/json'},authHeaders(k)),
+    body:body?JSON.stringify(body):undefined
   });
-  if (res.status === 401) {
-    authFailCount++;
-    sessionStorage.removeItem(SS_KEY);
-    showAuth();
-    if (authFailCount >= 3) {
-      authFailUntil = Date.now() + 60000;
-      authFailCount = 0;
-      throw new Error('认证多次失败，请检查管理密钥后 60s 再试');
-    }
-    throw new Error('management key 无效或缺失');
-  }
-  if (res.status === 403) {
-    authFailCount++;
-    var btxt = '';
-    try { btxt = await res.text(); } catch (e) {}
-    if (/IP banned|too many failed/i.test(btxt)) {
-      var waitMs = 60000;
-      var m = btxt.match(/(\d+)\s*m(?:in(?:ute)?s?)?\s*(\d+)\s*s/i) || btxt.match(/(\d+)\s*m/i);
-      if (m) {
-        var mins = parseInt(m[1], 10) || 0;
-        var secs = m[2] ? parseInt(m[2], 10) : 0;
-        waitMs = Math.min(Math.max((mins * 60 + secs) * 1000, 30000), 30 * 60 * 1000);
+  if(res.status===401){authFailCount++;sessionStorage.removeItem(SS_KEY);showAuth();if(authFailCount>=3){authFailUntil=Date.now()+60000;authFailCount=0;throw new Error('认证多次失败，请检查管理密钥后 60s 再试')}throw new Error('management key 无效或缺失')}
+  if(res.status===403){authFailCount++;var btxt='';try{btxt=await res.text()}catch(e){}
+    if(/IP banned|too many failed/i.test(btxt)){var waitMs=60000;var m=btxt.match(/(\d+)\s*m(?:in(?:ute)?s?)?\s*(\d+)\s*s/i)||btxt.match(/(\d+)\s*m/i);if(m){var mins=parseInt(m[1],10)||0;var secs=m[2]?parseInt(m[2],10):0;waitMs=Math.min(Math.max((mins*60+secs)*1000,30000),30*60*1000)}authFailUntil=Date.now()+waitMs;throw new Error(btxt.trim()||'IP 被封禁，请稍后再试')}
+    if(authFailCount>=3){authFailUntil=Date.now()+60000;authFailCount=0}throw new Error(btxt.trim()||'禁止访问 (403)')}
+  authFailCount=0;
+  var text=await res.text();
+  try{return JSON.parse(text)}catch(e){return {raw:text}}
+}
+
+async function checkinAll(btn){busy(btn,true);try{var r=await call('/checkin','POST',{});showCheckinOutcome(r);await load();}catch(e){toast(String(e),'err')}finally{busy(btn,false)}}
+function showCheckinOutcome(r){
+  if(!r||!r.summary){toast('签到完成','ok',JSON.stringify(r));return}
+  var s=r.summary;
+  if(s.fail>0)toast('签到完成 '+s.success+' 成功，'+s.fail+' 失败','warn','共 '+s.total+'，已签 '+s.already);
+  else toast('签到完成 '+s.success+' 成功','ok','共 '+s.total+(s.already?('，已签 '+s.already):''));
+}
+async function refreshCredits(btn){busy(btn,true);try{var d=await call('/refresh','POST',{});toast('积分已刷新','ok',(d.accounts||[]).length+' 个账号');await load();}catch(e){toast(String(e),'err')}finally{busy(btn,false)}}
+async function keepaliveAll(btn){busy(btn,true);try{var r=await call('/keepalive','POST',{});var n=(r.results||[]).filter(x=>!x.error).length;toast('Token 已刷新','ok',n+' 个账号');await load();}catch(e){toast(String(e),'err')}finally{busy(btn,false)}}
+async function selectAuth(idx){try{var r=await call('/select','POST',{auth_index:idx});toast('已选中 '+(r.nickname||idx),'ok');await load();}catch(e){toast(String(e),'err')}}
+async function checkinOne(a,btn){busy(btn,true);try{var r=await call('/checkin','POST',{auth_index:a.auth_index});var res=(r.results||[])[0];if(res&&exc(res.error)&&res.success)toast('签到成功'+(a.nickname?' · '+a.nickname:''),'ok');else if(res&&res.error)toast((a.nickname?esc(a.nickname)+' · ':'')+esc(res.error),'err');else toast('签到完成','ok',JSON.stringify(r));await load();}catch(e){toast(String(e),'err')}finally{busy(btn,false)}}
+function exc(s){return (s===null||s===undefined||s==='')}
+
+function statusBadge(a){
+  if(a.disabled)return '<span class="badge disabled">已禁用</span>';
+  if(a.cooling)return '<span class="badge cooling">冷却中</span>';
+  if(a.error)return '<span class="badge err">异常</span>';
+  return '<span class="badge">可用</span>';
+}
+
+async function load(btn){
+  if(btn)busy(btn,true);
+  try{
+    var [status,ver,data]=await Promise.all([call('/status'),call('/version'),call('/accounts')]);
+    var s=status||{};
+    document.getElementById('status').innerHTML=
+      '版本 <code>'+esc(s.version||'—')+'</code> · 签到 '+(s.checkin_auto?'开（每日 '+fmt(s.checkin_hour)+':00）':'关')+
+      ' · 预刷新 <code>'+esc((s.refresh_hours||[]).join(','))+'</code> · 调度 <code>'+esc(s.scheduler_mode||'—')+'</code>'+
+      (ver&&ver.current?(' · 上游 <code>'+esc(ver.current)+'</code>'):'');
+    var accounts=(data&&data.accounts)||[];
+    lastAccounts=accounts;
+    var active=data&&data.active;
+    var total=0,ok=0;
+    for(var i=0;i<accounts.length;i++){if(accounts[i].credits!==null&&accounts[i].credits!==undefined){total+=accounts[i].credits;ok++}}
+    document.getElementById('summary').innerHTML=
+      '<div class="summary-item"><div class="k">账号</div><div class="v">'+accounts.length+'</div></div>'+
+      '<div class="summary-item"><div class="k">积分可读</div><div class="v ok">'+ok+'</div></div>'+
+      '<div class="summary-item"><div class="k">剩余总计</div><div class="v">'+total+'</div></div>';
+    var html='';
+    for(var j=0;j<accounts.length;j++){
+      var a=accounts[j];
+      html+='<tr class="'+(a.auth_id===active?'sel':'')+'" data-idx="'+esc(a.auth_index)+'">'+
+        '<td>'+(a.auth_id===active?'●':'')+'</td>'+
+        '<td>'+esc(a.nickname||a.name||'—')+(
+          a.error?'<div class="err" style="font-size:11px">'+esc(a.error)+'</div>':'')+'</td>'+
+        '<td class="muted" style="font-family:ui-monospace,monospace">'+esc(a.uid||'—')+'</td>'+
+        '<td>'+(a.credits!==null&&a.credits!==undefined?esc(a.credits):'<span class="muted">—</span>')+'</td>'+
+        '<td>'+statusBadge(a)+'</td>'+
+        '<td><button type="button" data-act="select">选中</button> '+
+        '<button type="button" class="sec" data-act="checkin">签到</button></td>'+
+        '</tr>';
       }
-      authFailUntil = Date.now() + waitMs;
-      throw new Error(btxt.trim() || 'IP 被封禁，请稍后再试');
-    }
-    if (authFailCount >= 3) {
-      authFailUntil = Date.now() + 60000;
-      authFailCount = 0;
-    }
-    throw new Error(btxt.trim() || '禁止访问 (403)');
-  }
-  authFailCount = 0;
-  var text = await res.text();
-  try { return JSON.parse(text); } catch (e) { return {raw: text}; }
+    if(!accounts.length)html='<tr><td colspan="6" class="muted">没有账号</td></tr>';
+    document.getElementById('rows').innerHTML=html;
+    // 事件委托：选中/签到
+    document.getElementById('rows').addEventListener('click',function(ev){
+      var btn=ev.target.closest('button[data-act]');
+      if(!btn)return;
+      var tr=ev.target.closest('tr[data-idx]');
+      if(!tr)return;
+      var a=lastAccounts.find(function(x){return x.auth_index===tr.dataset.idx});
+      if(!a)return;
+      if(btn.dataset.act==='select')selectAuth(a.auth_index);
+      else if(btn.dataset.act==='checkin')checkinOne(a,btn);
+    });
+  }catch(e){
+    document.getElementById('rows').innerHTML='<tr><td colspan="6" class="err">加载失败: '+esc(String(e))+'</td></tr>';
+  }finally{if(btn)busy(btn,false)}
 }
 
-async function act(path, method, body) {
-  document.getElementById('out').textContent = '请求中…';
-  var r = await call(path, method || 'POST', body);
-  document.getElementById('out').textContent = JSON.stringify(r, null, 2);
-  await load();
-}
-
-async function selectAuth(idx) { await act('/select', 'POST', {auth_index: idx}); }
-
-async function load() {
-  var status = await call('/status', 'GET');
-  var data = await call('/accounts', 'GET');
-  document.getElementById('meta').textContent =
-    'trae v' + fmt(status.version) + ' · 签到 ' +
-    (status.checkin_auto ? '开（每日 ' + fmt(status.checkin_hour) + ':00）' : '关') +
-    ' · 预刷新 ' + JSON.stringify(status.refresh_hours || []) +
-    ' · 调度 ' + fmt(status.scheduler_mode);
-
-  var accounts = (data && data.accounts) || [];
-  var active = data && data.active;
-  var total = 0, ok = 0;
-  var html = '';
-  for (var i = 0; i < accounts.length; i++) {
-    var a = accounts[i];
-    if (a.credits !== null && a.credits !== undefined) { total += a.credits; ok++; }
-    var badges = [];
-    if (a.disabled) badges.push('<span class="badge b-off">已禁用</span>');
-    else if (a.cooling) badges.push('<span class="badge b-warn">冷却中</span>');
-    else badges.push('<span class="badge b-ok">可用</span>');
-    if (a.error) badges.push('<span class="err">' + a.error + '</span>');
-    html += '<tr class="' + (a.auth_id === active ? 'sel' : '') + '">' +
-      '<td>' + (a.auth_id === active ? '●' : '') + '</td>' +
-      '<td>' + fmt(a.nickname) + '</td>' +
-      '<td class="muted">' + fmt(a.uid) + '</td>' +
-      '<td>' + fmt(a.credits) + '</td>' +
-      '<td>' + badges.join(' ') + '</td>' +
-      '<td><button onclick="selectAuth(\'' + a.auth_index + '\')">选中</button> ' +
-      '<button onclick="act(\'/checkin\',\'POST\',{auth_index:\'' + a.auth_index + '\'})">签到</button></td>' +
-      '</tr>';
-  }
-  if (!accounts.length) html = '<tr><td colspan="6" class="muted">没有账号</td></tr>';
-  document.getElementById('rows').innerHTML = html;
-  document.getElementById('stats').innerHTML =
-    '<div class="stat"><b>' + accounts.length + '</b><span>账号</span></div>' +
-    '<div class="stat"><b>' + ok + '</b><span>积分可读</span></div>' +
-    '<div class="stat"><b>' + total + '</b><span>剩余总计</span></div>';
-}
-
-load().catch(function (e) {
-  document.getElementById('out').textContent = 'load failed: ' + e;
-});
+window.__traeThemeSync&&window.__traeThemeSync();
+load();
 </script>
 </body>
 </html>
