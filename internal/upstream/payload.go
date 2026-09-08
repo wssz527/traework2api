@@ -38,6 +38,15 @@ func PrepareBody(src []byte) []byte {
 			content, present := m["content"]
 			role, _ := m["role"].(string)
 
+			// 上游 SOLO 只接受 system/assistant/user/tool/function，拒绝 OpenAI 的
+			// developer role（报 4027 developer is not one of [...]）。部分客户端对
+			// reasoning 模型会把 system prompt 转成 developer 发送，此处归一化为
+			// system——两者语义等价，都是 system prompt 的载体。
+			if role == "developer" {
+				m["role"] = "system"
+				role = "system"
+			}
+
 			// assistant 消息回传 tool_calls: OpenAI function → 上游 function_call
 			if role == "assistant" {
 				if tcs, ok := m["tool_calls"].([]any); ok {

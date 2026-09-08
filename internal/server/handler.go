@@ -215,25 +215,59 @@ func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 }
 
 // modelList 动态获取模型列表并包装成 OpenAI 格式；失败回退静态表。
+// 已弃用的旧版模型（DeepSeek-V4-Pro / DeepSeek-V4-Flash）在动态列表中过滤掉，
+// 只保留对应 Official 正式版，避免新旧混在一起。
+var deprecatedModelIDs = map[string]bool{
+	"DeepSeek-V4-Pro":   true,
+	"DeepSeek-V4-Flash": true,
+}
+
 func (h *Handler) modelList() []map[string]any {
 	if infos := h.fetchDynamicModels(); len(infos) > 0 {
 		out := make([]map[string]any, 0, len(infos))
 		for _, mi := range infos {
-			entry := map[string]any{
-				"id":             mi.ID,
-				"object":         "model",
-				"created":        1753600000,
-				"owned_by":       "trae-solo",
-				"context_length": mi.ContextWindow,
+			if deprecatedModelIDs[mi.ID] {
+				continue
 			}
-			if entry["context_length"] == 0 {
-				entry["context_length"] = 131072
+			entry := map[string]any{
+				"id":                mi.ID,
+				"object":            "model",
+				"created":           1753600000,
+				"owned_by":          "trae-solo",
+				"supports_max_mode": mi.MaxMode,
+				"multimodal":        mi.Multimodal,
+			}
+			setModelLimits(entry, mi.ContextWindow, mi.InputTokens, mi.MaxTokens)
+			if len(mi.ReasoningEfforts) > 0 {
+				entry["reasoning_efforts"] = mi.ReasoningEfforts
+				entry["default_reasoning_effort"] = mi.DefaultReasoningEffort
 			}
 			out = append(out, entry)
+			if mi.MaxMode {
+				maxEntry := make(map[string]any, len(entry))
+				for k, v := range entry {
+					maxEntry[k] = v
+				}
+				maxEntry["id"], maxEntry["max_mode"] = mi.ID+"-max", true
+				setModelLimits(maxEntry, mi.MaxContextWindow, mi.MaxModeInputTokens, mi.MaxModeOutputTokens)
+				out = append(out, maxEntry)
+			}
 		}
 		return out
 	}
 	return staticModels
+}
+
+func setModelLimits(entry map[string]any, contextWindow, input, output int64) {
+	for name, limit := range map[string]int64{"context_length": contextWindow, "max_input_tokens": input, "max_output_tokens": output} {
+		delete(entry, name)
+		if limit > 0 {
+			entry[name] = limit
+		}
+	}
+	if entry["context_length"] == nil {
+		entry["context_length"] = 131072
+	}
 }
 
 // fetchDynamicModels 从池中任一健康账号拉模型列表（get_detail_param），缓存 1h。

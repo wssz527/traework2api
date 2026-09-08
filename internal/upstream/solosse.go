@@ -437,7 +437,12 @@ func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)
 		}
 	}
 	if !sawDone {
-		// 幂等兜底：上游中断（无 done）仍写 [DONE]。
+		// 幂等兜底：上游中断（无 done）仍补发带 finish_reason 的完成 chunk + [DONE]。
+		// 只补 [DONE] 会让客户端报 "Stream ended without finish_reason"，
+		// 故先补一个 finish_reason:"stop" 的 chunk 再补 [DONE]。
+		if err := writeChunk(map[string]any{}, "stop"); err != nil {
+			return err
+		}
 		return writeDONE()
 	}
 	return nil

@@ -262,13 +262,21 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status
 
 // ModelInfo 动态模型信息。
 type ModelInfo struct {
-	ID            string
-	Name          string
-	ContextWindow int64 // = maxInputTokens
-	MaxTokens     int64 // = maxOutputTokens
+	ID                     string
+	Name                   string
+	ContextWindow          int64 // 上游声明的普通模式总上下文。
+	InputTokens            int64
+	MaxTokens              int64 // = maxOutputTokens
+	MaxMode                bool
+	MaxContextWindow       int64
+	MaxModeInputTokens     int64
+	MaxModeOutputTokens    int64
+	Multimodal             bool
+	ReasoningEfforts       []string
+	DefaultReasoningEffort string
 }
 
-// FetchModels 拉 SOLO 模型表（get_detail_param，32 配置）。
+// FetchModels 拉 SOLO 模型表（get_detail_param）。
 func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	body := map[string]any{
 		"function":            Function,
@@ -291,12 +299,22 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	}
 	var resp struct {
 		ConfigInfoList []struct {
-			ConfigName string `json:"config_name"`
+			ConfigName    string `json:"config_name"`
 			DisplayConfig struct {
 				DisplayName string `json:"display_name"`
+				MaxMode     bool   `json:"max_mode"`
+				Multimodal  bool   `json:"multimodal"`
 			} `json:"display_config"`
+			ContextWindowTokens   map[string]int64 `json:"context_window_tokens"`
+			ReasoningEffortConfig struct {
+				SupportThinking bool     `json:"support_thinking"`
+				DefaultLevel    string   `json:"default_level"`
+				Options         []string `json:"options"`
+			} `json:"reasoning_effort_config"`
 			ModelDetailList []struct {
-				ModelName string `json:"model_name"`
+				ModelName       string `json:"model_name"`
+				PromptMaxTokens int64  `json:"prompt_max_tokens"`
+				MaxTokens       int64  `json:"max_tokens"`
 			} `json:"model_detail_list"`
 		} `json:"config_info_list"`
 	}
@@ -308,10 +326,27 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 		if cfg.ConfigName == "" {
 			continue
 		}
-		out = append(out, ModelInfo{
-			ID:   cfg.ConfigName,
-			Name: cfg.DisplayConfig.DisplayName,
-		})
+		info := ModelInfo{
+			ID:               cfg.ConfigName,
+			Name:             cfg.DisplayConfig.DisplayName,
+			ContextWindow:    cfg.ContextWindowTokens["dev"],
+			MaxContextWindow: cfg.ContextWindowTokens["max"],
+			MaxMode:          cfg.DisplayConfig.MaxMode,
+			Multimodal:       cfg.DisplayConfig.Multimodal,
+		}
+		for _, detail := range cfg.ModelDetailList {
+			switch {
+			case strings.HasSuffix(detail.ModelName, "__dev"):
+				info.InputTokens, info.MaxTokens = detail.PromptMaxTokens, detail.MaxTokens
+			case strings.HasSuffix(detail.ModelName, "__max"):
+				info.MaxModeInputTokens, info.MaxModeOutputTokens = detail.PromptMaxTokens, detail.MaxTokens
+			}
+		}
+		if cfg.ReasoningEffortConfig.SupportThinking {
+			info.ReasoningEfforts = cfg.ReasoningEffortConfig.Options
+			info.DefaultReasoningEffort = cfg.ReasoningEffortConfig.DefaultLevel
+		}
+		out = append(out, info)
 	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("models api returned empty list")
