@@ -1,0 +1,22 @@
+# build artifacts
+trae.dylib
+trae.h
+*.so
+dist/
+bin/
+
+# credentials — never commit
+auths/
+*.json.tmp
+trae-*.json
+workbuddy-*.json
+kimi-*.json
+
+# test / coverage
+coverage.out
+coverage.html
+
+# editor / OS
+.DS_Store
+.idea/
+.vscode/

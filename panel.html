@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Trae · CPA 插件面板</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { margin:0; font:14px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",Arial,sans-serif;
+         background:#f6f7f9; color:#1c1e21; }
+  .wrap { max-width: 960px; margin:0 auto; padding:24px 16px 64px; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  .sub { color:#6b7280; font-size:12px; margin-bottom:20px; }
+  .bar { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:16px; }
+  button { padding:6px 14px; border:1px solid #d1d5db; border-radius:6px; background:#fff;
+           color:#1c1e21; cursor:pointer; font-size:13px; }
+  button:hover { background:#f3f4f6; }
+  button:disabled { opacity:.5; cursor:default; }
+  table { width:100%; border-collapse:collapse; background:#fff; border:1px solid #e5e7eb; border-radius:8px; overflow:hidden; }
+  th, td { padding:8px 10px; text-align:left; border-bottom:1px solid #f0f1f3; font-size:13px; }
+  th { background:#fafbfc; font-weight:600; color:#4b5563; }
+  tr:last-child td { border-bottom:none; }
+  .sel { background:#eff6ff; }
+  .badge { display:inline-block; padding:1px 7px; border-radius:10px; font-size:11px; }
+  .b-ok { background:#dcfce7; color:#166534; }
+  .b-warn { background:#fef3c7; color:#92400e; }
+  .b-off { background:#f3f4f6; color:#6b7280; }
+  .err { color:#b91c1c; }
+  pre { background:#fff; border:1px solid #e5e7eb; border-radius:8px; padding:12px; overflow:auto;
+        max-height:320px; font-size:12px; }
+  .muted { color:#6b7280; }
+  .row { display:flex; gap:16px; flex-wrap:wrap; margin-bottom:12px; }
+  .stat { background:#fff; border:1px solid #e5e7eb; border-radius:8px; padding:10px 14px; min-width:120px; }
+  .stat b { display:block; font-size:18px; }
+  .stat span { font-size:11px; color:#6b7280; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Trae · CLIProxyAPI 插件</h1>
+  <div class="sub" id="meta">加载中…</div>
+
+  <div class="bar">
+    <button onclick="act('/checkin','POST',{})">全量签到</button>
+    <button onclick="act('/refresh','POST',{})">刷新积分</button>
+    <button onclick="act('/keepalive','POST',{})">刷新 Token</button>
+    <button onclick="load()">重新加载</button>
+  </div>
+
+  <div class="row" id="stats"></div>
+
+  <table>
+    <thead>
+      <tr><th>选中</th><th>昵称</th><th>UID</th><th>剩余积分</th><th>状态</th><th>操作</th></tr>
+    </thead>
+    <tbody id="rows"><tr><td colspan="6" class="muted">加载中…</td></tr></tbody>
+  </table>
+
+  <h2 style="font-size:15px;margin:24px 0 8px">最近一次响应</h2>
+  <pre id="out">—</pre>
+</div>
+
+<script>
+// 管理接口前缀：宿主把插件路由挂在 /v0/management/plugins/<id> 下。
+var BASE = location.pathname.replace(/\/v0\/resource\/plugins\/trae.*$/, '') + '/v0/management/plugins/trae';
+
+function fmt(n) { return n === null || n === undefined ? '—' : String(n); }
+
+async function call(path, method, body) {
+  var res = await fetch(BASE + path, {
+    method: method || 'GET',
+    headers: {'Content-Type': 'application/json'},
+    body: body ? JSON.stringify(body) : undefined
+  });
+  var text = await res.text();
+  try { return JSON.parse(text); } catch (e) { return {raw: text}; }
+}
+
+async function act(path, method, body) {
+  document.getElementById('out').textContent = '请求中…';
+  var r = await call(path, method || 'POST', body);
+  document.getElementById('out').textContent = JSON.stringify(r, null, 2);
+  await load();
+}
+
+async function selectAuth(idx) { await act('/select', 'POST', {auth_index: idx}); }
+
+async function load() {
+  var status = await call('/status', 'GET');
+  var data = await call('/accounts', 'GET');
+  document.getElementById('meta').textContent =
+    'trae v' + fmt(status.version) + ' · 签到 ' +
+    (status.checkin_auto ? '开（每日 ' + fmt(status.checkin_hour) + ':00）' : '关') +
+    ' · 预刷新 ' + JSON.stringify(status.refresh_hours || []) +
+    ' · 调度 ' + fmt(status.scheduler_mode);
+
+  var accounts = (data && data.accounts) || [];
+  var active = data && data.active;
+  var total = 0, ok = 0;
+  var html = '';
+  for (var i = 0; i < accounts.length; i++) {
+    var a = accounts[i];
+    if (a.credits !== null && a.credits !== undefined) { total += a.credits; ok++; }
+    var badges = [];
+    if (a.disabled) badges.push('<span class="badge b-off">已禁用</span>');
+    else if (a.cooling) badges.push('<span class="badge b-warn">冷却中</span>');
+    else badges.push('<span class="badge b-ok">可用</span>');
+    if (a.error) badges.push('<span class="err">' + a.error + '</span>');
+    html += '<tr class="' + (a.auth_id === active ? 'sel' : '') + '">' +
+      '<td>' + (a.auth_id === active ? '●' : '') + '</td>' +
+      '<td>' + fmt(a.nickname) + '</td>' +
+      '<td class="muted">' + fmt(a.uid) + '</td>' +
+      '<td>' + fmt(a.credits) + '</td>' +
+      '<td>' + badges.join(' ') + '</td>' +
+      '<td><button onclick="selectAuth(\'' + a.auth_index + '\')">选中</button> ' +
+      '<button onclick="act(\'/checkin\',\'POST\',{auth_index:\'' + a.auth_index + '\'})">签到</button></td>' +
+      '</tr>';
+  }
+  if (!accounts.length) html = '<tr><td colspan="6" class="muted">没有账号</td></tr>';
+  document.getElementById('rows').innerHTML = html;
+  document.getElementById('stats').innerHTML =
+    '<div class="stat"><b>' + accounts.length + '</b><span>账号</span></div>' +
+    '<div class="stat"><b>' + ok + '</b><span>积分可读</span></div>' +
+    '<div class="stat"><b>' + total + '</b><span>剩余总计</span></div>';
+}
+
+load().catch(function (e) {
+  document.getElementById('out').textContent = 'load failed: ' + e;
+});
+</script>
+</body>
+</html>
