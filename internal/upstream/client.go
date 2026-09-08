@@ -274,6 +274,7 @@ type ModelInfo struct {
 	Multimodal             bool
 	ReasoningEfforts       []string
 	DefaultReasoningEffort string
+	ConsumptionRate        float64 // display_contact_config.consumption_rate.data.rate（积分消耗倍率）
 }
 
 // FetchModels 拉 SOLO 模型表（get_detail_param）。
@@ -305,7 +306,9 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 				MaxMode     bool   `json:"max_mode"`
 				Multimodal  bool   `json:"multimodal"`
 			} `json:"display_config"`
-			ContextWindowTokens   map[string]int64 `json:"context_window_tokens"`
+			// display_contact_config 是内嵌 JSON 字符串，含 consumption_rate.data.rate
+			DisplayContactConfig  string            `json:"display_contact_config"`
+			ContextWindowTokens   map[string]int64  `json:"context_window_tokens"`
 			ReasoningEffortConfig struct {
 				SupportThinking bool     `json:"support_thinking"`
 				DefaultLevel    string   `json:"default_level"`
@@ -345,6 +348,20 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 		if cfg.ReasoningEffortConfig.SupportThinking {
 			info.ReasoningEfforts = cfg.ReasoningEffortConfig.Options
 			info.DefaultReasoningEffort = cfg.ReasoningEffortConfig.DefaultLevel
+		}
+		// display_contact_config 是内嵌 JSON 字符串：解析 consumption_rate.data.rate
+		if cfg.DisplayContactConfig != "" {
+			var dcc struct {
+				ConsumptionRate *struct {
+					Data *struct {
+						Rate *float64 `json:"rate"`
+					} `json:"data"`
+				} `json:"consumption_rate"`
+			}
+			if err := json.Unmarshal([]byte(cfg.DisplayContactConfig), &dcc); err == nil &&
+				dcc.ConsumptionRate != nil && dcc.ConsumptionRate.Data != nil && dcc.ConsumptionRate.Data.Rate != nil {
+				info.ConsumptionRate = *dcc.ConsumptionRate.Data.Rate
+			}
 		}
 		out = append(out, info)
 	}

@@ -237,6 +237,9 @@ func (h *Handler) modelList() []map[string]any {
 				"supports_max_mode": mi.MaxMode,
 				"multimodal":        mi.Multimodal,
 			}
+			if mi.ConsumptionRate > 0 {
+				entry["consumption_rate"] = mi.ConsumptionRate
+			}
 			setModelLimits(entry, mi.ContextWindow, mi.InputTokens, mi.MaxTokens)
 			if len(mi.ReasoningEfforts) > 0 {
 				entry["reasoning_efforts"] = mi.ReasoningEfforts
