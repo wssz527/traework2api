@@ -294,6 +294,8 @@ func traeRegistration() registration {
 				{Name: "refresh_skew", Type: pluginapi.ConfigFieldTypeString, Description: "Pre-refresh window for access tokens, Go duration (default 24h)."},
 				{Name: "lifecycle_auto", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Auto disable auths on session death / plan-limit cooldown (default true)."},
 				{Name: "scheduler_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{schedulerModeOff, schedulerModeCredits}, Description: "off (defer to CPA built-in, default) or credits (pick highest remaining credits)."},
+				{Name: "version_track", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Auto-track upstream TRAE client version (default true; never downgrades below the built-in constant)."},
+				{Name: "version_track_interval", Type: pluginapi.ConfigFieldTypeString, Description: "How often to re-probe the version, Go duration (default 24h)."},
 				{Name: "models", Type: pluginapi.ConfigFieldTypeArray, Description: "Optional model list override."},
 			},
 		},

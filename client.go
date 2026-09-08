@@ -480,7 +480,7 @@ func (c *Client) GetUserInfo(a *traeAuth) (uid, nickname, enterpriseID string, e
 	if host == "" {
 		host = c.oauthBase()
 	}
-	body := map[string]any{"ReqSource": "IDE", "IDEVersion": IdeVersion}
+	body := map[string]any{"ReqSource": "IDE", "IDEVersion": ideVersion()}
 	raw, _ := json.Marshal(body)
 	req, err := http.NewRequest(http.MethodPost, host+EpUserInfo, bytes.NewReader(raw))
 	if err != nil {

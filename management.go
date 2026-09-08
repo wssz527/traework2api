@@ -67,6 +67,8 @@ func managementRegistration() managementRegistrationResponse {
 			{Method: http.MethodPost, Path: base + "/select", Description: "Select the active account used for chat routing (body auth_index)."},
 			{Method: http.MethodPost, Path: base + "/keepalive", Description: "Manually refresh access tokens for all accounts (or one with auth_index)."},
 			{Method: http.MethodGet, Path: base + "/status", Description: "Scheduler status: checkin hour, refresh hours, modes."},
+			{Method: http.MethodGet, Path: base + "/version", Description: "Upstream client version tracking: current, built-in, cache and sources."},
+			{Method: http.MethodPost, Path: base + "/version/refresh", Description: "Force an upstream version re-probe (background; non-blocking)."},
 		},
 		Resources: []resourceRoute{
 			{Path: "/panel", Menu: "Trae", Description: "Trae dashboard: credits, check-in, account select."},
@@ -115,6 +117,11 @@ func handleManagement(raw []byte) (resp []byte, err error) {
 		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleKeepalive(req)))
 	case req.Method == http.MethodGet && path == base+"/status":
 		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleStatus()))
+	case req.Method == http.MethodGet && path == base+"/version":
+		return okEnvelope(mgmtJSONResponse(http.StatusOK, versionStatus()))
+	case req.Method == http.MethodPost && path == base+"/version/refresh":
+		go refreshUpstreamVersion()
+		return okEnvelope(mgmtJSONResponse(http.StatusOK, map[string]any{"started": true}))
 	}
 	return okEnvelope(mgmtJSONResponse(http.StatusNotFound, map[string]any{"error": "not found: " + path}))
 }

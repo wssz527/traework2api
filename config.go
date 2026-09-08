@@ -59,6 +59,18 @@ func configure(raw []byte) {
 			setLifecycleAuto(b)
 		}
 	}
+	if v, ok := fields["version_track"]; ok {
+		if b, ok := parseBool(v); ok {
+			setVersionTracking(b)
+		}
+	}
+	if v, ok := fields["version_track_interval"]; ok {
+		if sv, ok := v.(string); ok {
+			if d, err := time.ParseDuration(strings.TrimSpace(sv)); err == nil {
+				setVersionInterval(d)
+			}
+		}
+	}
 	if v, ok := fields["scheduler_mode"]; ok {
 		if s, ok := v.(string); ok {
 			mode := strings.ToLower(strings.TrimSpace(s))

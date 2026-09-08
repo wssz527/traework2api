@@ -168,6 +168,8 @@ func ensureScheduler() {
 	}
 	schedulerStop = make(chan struct{})
 	go schedulerLoop(schedulerStop)
+	// 版本跟踪用自己的固定间隔，不挂整点触发。
+	ensureVersionTracker()
 }
 
 // 注意：故意不提供 stop 函数。宿主的 shutdown 导出是 no-op（见 main.go），

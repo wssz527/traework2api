@@ -59,6 +59,28 @@ c-shared **没有进程隔离**——一个 panic 会拖垮整个 CPA 进程（8
 | `refresh_skew` | `24h` | 预刷新窗口 |
 | `lifecycle_auto` | `true` | 冷却/禁用自动生效 |
 | `scheduler_mode` | `off` | `off`=交给 CPA 内建；`credits`=插件挑号（面板选中 + 粘性） |
+| `version_track` | `true` | 上游客户端版本自动跟踪（见 §2.1） |
+| `version_track_interval` | `24h` | 版本探测间隔（Go duration） |
+
+### 2.1 上游客户端版本自动跟踪
+
+上游 / TRAE 客户端发新版时插件自己跟上，不需要手动改 `constants.go`。
+
+**三级回退**：
+
+1. **公开网页源**（默认 24h 探一次）：`https://www.trae.cn/changelog`、`https://docs.trae.cn/work_changelog`，两个都试，取解析成功且版本最大的那个
+2. **本机客户端探测**：`/Applications/TRAE SOLO CN.app/Contents/Info.plist` 的 `CFBundleShortVersionString`（未安装则跳过）
+3. **内置常量**：`constants.go` 的 `IdeVersion` / `IdeVersionCode`（最终回退，也是下限）
+
+**"只进不退"保护（关键）**：实测（2026-09-08）两个网页源都停留在 `0.1.49-52`（2026-08-21），而内置常量与本机客户端都是 `0.1.63`。若网页优先且取到就用，插件会把版本**降**到 0.1.49 —— 那是回退不是跟踪，上游可能据此改变行为。因此内置常量被当作**下限**：取所有来源的最大值，跟踪只向前走。
+
+缓存：成功 24h，失败负缓存 1h。失败静默回退，**绝不阻塞请求链路**（无缓存时先用内置常量，探测在后台 goroutine 做）。加 debug 日志。
+
+解析保守：只接受严格 `\d+\.\d+\.\d+`；只取 `TraeWork` 产品线（页面同时列 TraeCode 3.x 与 TRAE APP 0.0.x）；页面结构变化抓不到就当失败，不产出垃圾值。网页源只有版本号时 `IdeVersionCode` 取页面日期。
+
+请求头 `User-Agent` / `X-Ide-Version` / `X-Ide-Version-Code` / `X-App-Version-Code` 与 `GetUserInfo` 的 `IDEVersion` 都读跟踪结果而非常量。
+
+运维接口：`GET /version`（当前值、内置值、缓存状态、源列表）、`POST /version/refresh`（后台强制重探，不阻塞）。
 
 ---
 
@@ -114,6 +136,8 @@ c-shared **没有进程隔离**——一个 panic 会拖垮整个 CPA 进程（8
 | POST | `/select` | 切换 active auth（chat 路由优先账号） |
 | POST | `/keepalive` | 手动刷新 token（单号或全量） |
 | GET | `/status` | 调度器与生命周期配置 |
+| GET | `/version` | 上游版本跟踪：当前值、内置值、缓存状态、源列表 |
+| POST | `/version/refresh` | 强制重新探测上游版本（后台执行，不阻塞） |
 
 ```bash
 KEY=$(cat ~/.cli-proxy-api/.mgmt_key)
@@ -139,7 +163,7 @@ make test      # go test -race -count=1 ./...
 make lint      # gofmt + go vet
 ```
 
-当前状态：`make build` 通过（6.9 MB，四个 ABI 符号齐全）；`go test -race ./...` 通过，110 个测试；`go vet` / `gofmt` 干净。
+当前状态：`make build` 通过（7.0 MB，四个 ABI 符号齐全）；`go test -race ./...` 通过，145 个测试；`go vet` / `gofmt` 干净。
 
 测试全部使用**合成假数据**（`at-placeholder` / `rt-placeholder`），不读 `~/.cli-proxy-api/trae-*.json`，不把 token 写进断言或输出。
 
@@ -157,6 +181,7 @@ make lint      # gofmt + go vet
 | 6 | usage 走外部上报（CPAMP） | 未实现（`usage_plugin: false`） | 本机无 CPAMP 部署；留到有上报目标时再加 |
 | 7 | `login.sh` 保留为独立脚本，改 2 处 | 同目录提供改造版 `login.sh`：改 `AUTH_DIR`、加 `"type":"trae"`、删 docker 段 | 与方案一致；末尾不再 curl `:7864` |
 | 8 | 凭证迁移"只复制不删源" | 未执行（由主会话割接时做） | 红线：不得动在役服务与 `~/.cli-proxy-api/` |
+| 9 | 版本跟踪（补充需求）：网页源优先、取到即用 | 改为**取所有来源最大值 + 内置常量作下限** | 实测两个网页源停留在 0.1.49-52，而内置/本机是 0.1.63；照原样实现会把版本降级，反而破坏在役链路 |
 
 未改动的上游常量集中在 `constants.go`（原文件注释"禁止改动"），原样搬运。
 
@@ -259,6 +284,7 @@ open http://127.0.0.1:8317/v0/resource/plugins/trae/panel
 ```
 trae-plugin-build/
 ├── main.go               C ABI 导出、RPC 分发、registration、auth.parse/refresh
+├── version.go            上游客户端版本自动跟踪（三级回退 + 缓存）
 ├── constants.go          上游技术常量（原样，禁止改动）
 ├── headers.go            SOLO / ug / oauth 三类请求头
 ├── payload.go            OpenAI → SOLO 请求体改写
@@ -275,10 +301,11 @@ trae-plugin-build/
 ├── active_auth.go        面板选中账号（粘性路由）
 ├── management.go         management 路由与处理
 ├── credits.go            积分缓存 + 账号行结构
-├── config.go             plugin.reconfigure 配置解析
+├── config.go             plugin.reconfigure 配置解析（含 version_track）
 ├── panel.go / panel.html 面板页面
 ├── redact.go             凭证脱敏
 ├── login.sh              改造版登录脚本
 ├── Makefile / go.mod / VERSION / .gitignore
-└── *_test.go             110 个测试（合成假数据）
+├── version_fixtures_test.go  静态 HTML 样例（官方更新日志页片段）
+└── *_test.go             145 个测试（合成假数据；单测不依赖真实外网）
 ```

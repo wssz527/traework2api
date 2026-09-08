@@ -4,10 +4,11 @@ package main
 
 import "net/http"
 
-const clientUA = "Trae/" + IdeVersion
-
 // SOLOHeaders 设置 llm_utils_chat / get_detail_param 所需的 SOLO 专属头。
 // 规则来自 SPEC §1 SOLO headers（实测必须）。
+//
+// UA / X-Ide-Version / X-Ide-Version-Code 取版本跟踪结果（version.go），
+// 而不是直接读 constants.go 常量 —— 上游发新版时插件自动跟上。
 func SOLOHeaders(req *http.Request, a *traeAuth, stream bool) {
 	req.Header.Set("Content-Type", "application/json")
 	if stream {
@@ -15,7 +16,7 @@ func SOLOHeaders(req *http.Request, a *traeAuth, stream bool) {
 	} else {
 		req.Header.Set("Accept", "application/json")
 	}
-	req.Header.Set("User-Agent", clientUA)
+	req.Header.Set("User-Agent", clientUAValue())
 	at := a.JWT() // 读锁快照，防与 RefreshToken 写并发竞态
 	req.Header.Set("Authorization", "Cloud-IDE-JWT "+at)
 	req.Header.Set("X-Cloudide-Token", at)
@@ -25,9 +26,9 @@ func SOLOHeaders(req *http.Request, a *traeAuth, stream bool) {
 	}
 	req.Header.Set("X-App-Id", AppID)
 	req.Header.Set("X-App-Version", "default")
-	req.Header.Set("X-Ide-Version", IdeVersion)
-	req.Header.Set("X-Ide-Version-Code", IdeVersionCode)
-	req.Header.Set("X-App-Version-Code", IdeVersionCode)
+	req.Header.Set("X-Ide-Version", ideVersion())
+	req.Header.Set("X-Ide-Version-Code", ideVersionCode())
+	req.Header.Set("X-App-Version-Code", ideVersionCode())
 	req.Header.Set("X-Ide-Version-Type", "stable")
 	req.Header.Set("X-Device-Type", "windows")
 	req.Header.Set("X-OS-Version", OSVersion)
@@ -45,7 +46,7 @@ func SOLOHeaders(req *http.Request, a *traeAuth, stream bool) {
 func UgHeaders(req *http.Request, a *traeAuth) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", clientUA)
+	req.Header.Set("User-Agent", clientUAValue())
 	req.Header.Set("Authorization", "Cloud-IDE-JWT "+a.JWT()) // 读锁快照
 	req.Header.Set("X-User-Region", "CN")
 	if a.CheckinDeviceID != "" {
@@ -63,5 +64,5 @@ func UgHeaders(req *http.Request, a *traeAuth) {
 func OAuthHeaders(req *http.Request) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", clientUA)
+	req.Header.Set("User-Agent", clientUAValue())
 }
