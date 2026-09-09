@@ -5,6 +5,7 @@ package main
 
 import (
 	"encoding/json"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -12,11 +13,15 @@ import (
 
 // pluginConfigRequest 宿主下发配置的已知形状。不同 CPA 版本字段位置略有差异，
 // 这里做最大兼容：config 可能是 map，也可能嵌在 config_yaml / values 里。
+//
+// 注意：config_yaml 是**字符串**（宿主把本插件的 config 段渲染成 YAML 文本，
+// 见 pluginhost.rpcLifecycleRequest ConfigYAML []byte），不是 map。之前声明成
+// map 导致整体 json.Unmarshal 失败、配置从未生效（所有值都是默认值）。
 type pluginConfigRequest struct {
-	Config    map[string]any `json:"config"`
-	ConfigMap map[string]any `json:"config_yaml"`
-	Values    map[string]any `json:"values"`
-	Enabled   *bool          `json:"enabled"`
+	Config     map[string]any `json:"config"`
+	ConfigYAML []byte         `json:"config_yaml"`
+	Values     map[string]any `json:"values"`
+	Enabled    *bool          `json:"enabled"`
 }
 
 // configure 应用插件配置并启动调度器。任何解析失败都不影响插件注册。
@@ -83,14 +88,69 @@ func configure(raw []byte) {
 	ensureScheduler()
 }
 
-// firstConfigMap 从候选字段中挑第一个非空配置 map。
+// firstConfigMap 从候选字段中挑第一个非空配置 map；config_yaml 是 YAML 文本，
+// 用简易行解析转成 map（本插件配置只有一层：标量 + 行内列表）。
 func firstConfigMap(req pluginConfigRequest) map[string]any {
-	for _, m := range []map[string]any{req.Config, req.ConfigMap, req.Values} {
+	for _, m := range []map[string]any{req.Config, req.Values} {
 		if len(m) > 0 {
 			return m
 		}
 	}
-	return nil
+	return parseConfigYAMLText(req.ConfigYAML)
+}
+
+// parseConfigYAMLText 把单层的 `key: value` YAML 文本解析成 map。
+// 支持：bool、数字、行内整型列表（[3] / [3, 21]）、字符串（去引号）。
+// 不认识或嵌套的行直接跳过——配置解析绝不能导致注册失败。
+func parseConfigYAMLText(raw []byte) map[string]any {
+	if len(raw) == 0 {
+		return nil
+	}
+	out := make(map[string]any)
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		k, v, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		k = strings.TrimSpace(k)
+		v = strings.TrimSpace(v)
+		if k == "" || v == "" {
+			continue
+		}
+		out[k] = parseConfigYAMLValue(v)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func parseConfigYAMLValue(v string) any {
+	if strings.HasPrefix(v, "[") && strings.HasSuffix(v, "]") {
+		inner := strings.TrimSpace(v[1 : len(v)-1])
+		if inner == "" {
+			return []any{}
+		}
+		var list []any
+		for _, item := range strings.Split(inner, ",") {
+			item = strings.TrimSpace(item)
+			if n, err := strconv.Atoi(item); err == nil {
+				list = append(list, n)
+			}
+		}
+		return list
+	}
+	if b, err := strconv.ParseBool(v); err == nil {
+		return b
+	}
+	if n, err := strconv.Atoi(v); err == nil {
+		return n
+	}
+	return strings.Trim(v, "\"'")
 }
 
 var (

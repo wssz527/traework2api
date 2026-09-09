@@ -99,6 +99,9 @@ func setRefreshHours(hours []int) {
 }
 
 // handleSchedulerPick 挑号。mode=off 时全部 defer 给 CPA 内建。
+// mode=credits 时做会话级粘性+分摊：已绑定会话在其账号可用时钉住不动
+// （对齐面板选中态）；新会话选「活跃绑定最少」的账号，把并发会话隔到不同
+// 账号的并发位上。无会话信号的请求退回 pickActiveAuth（面板粘性）。
 func handleSchedulerPick(raw []byte) ([]byte, error) {
 	var req pluginapi.SchedulerPickRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
@@ -124,9 +127,30 @@ func handleSchedulerPick(raw []byte) ([]byte, error) {
 	if len(cands) == 0 {
 		return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
 	}
-	picked := pickActiveAuth(cands)
+
+	now := time.Now()
+	sessionKey := stickySessionKey(&req)
+	if sessionKey != "" {
+		if bound := stickyValidBinding(sessionKey, cands, now); bound != "" {
+			// 面板「使用中」跟随真实路由。
+			if bound != getActiveAuthID() {
+				setActiveAuthID(bound)
+			}
+			return okEnvelope(pluginapi.SchedulerPickResponse{AuthID: bound, Handled: true})
+		}
+	}
+
+	picked := ""
+	if sessionKey != "" {
+		picked = pickSpreadAuth(cands, stickyActiveBindingCounts(now))
+	} else {
+		picked = pickActiveAuth(cands)
+	}
 	if picked == "" {
 		return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
+	}
+	if sessionKey != "" {
+		stickyBind(sessionKey, picked, now)
 	}
 	return okEnvelope(pluginapi.SchedulerPickResponse{AuthID: picked, Handled: true})
 }
