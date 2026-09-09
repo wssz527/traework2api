@@ -70,7 +70,7 @@ button.sec{background:var(--btn-sec);color:var(--fg)}button.sec:hover{background
 .summary-hd{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px}
 .summary-title{font-weight:700;font-size:14px}
 .summary-meta{color:var(--mut);font-size:12px}
-.summary-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px}
+.summary-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin-bottom:10px}
 /* 内嵌指标格：与账号卡内部表面一致（--surface），不用更深的 surface-muted */
 .summary-item{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:10px 12px}
 .summary-item .k{color:var(--mut);font-size:11px;margin-bottom:4px}
@@ -78,8 +78,7 @@ button.sec{background:var(--btn-sec);color:var(--fg)}button.sec:hover{background
 .summary-item .v.ok{color:var(--ok)}
 .summary-item .v.warn{color:var(--warn)}
 .summary-item .v.err{color:var(--err)}
-/* 账号卡内的积分格：与 summary-grid 视觉一致，但去掉网格间距带来的额外上边距 */
-.card .summary-item{margin-top:2px}
+
 .summary .pb{margin-top:4px}
 .row{display:flex;justify-content:space-between;padding:5px 0;border-top:1px dashed var(--border);gap:12px}
 .row:first-of-type{border-top:0}.k{color:var(--mut)}.v{font-weight:600}
@@ -311,6 +310,47 @@ function markCheckinDone(btn){
 }
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
 function hasCredits(a){return a&&a.credits!==null&&a.credits!==undefined}
+// creditsOf 归一账号的用量三元组（remain/used/size），兼容 credits_detail 与
+// 只有 credits 的老数据。known=false 表示没有任何用量信号。
+function creditsOf(a){
+  var d=(a&&a.credits_detail)||null;
+  var remain=0,used=0,size=0;
+  if(d){
+    remain=Number(d.total_remain)||0;
+    used=Number(d.total_used)||0;
+    size=Number(d.total_size)||0;
+  }else if(hasCredits(a)){
+    remain=Number(a.credits)||0;
+  }else{
+    return {remain:0,used:0,size:0,packs:0,fetched:"",known:false};
+  }
+  if(!size&&d==null)size=remain+used;
+  var known=remain>0||used>0||size>0||((a&&a.credits_detail&&a.credits_detail.pack_count)||0)>0;
+  return {
+    remain:remain,used:used,size:size,
+    packs:(d&&Number(d.pack_count))||0,
+    fetched:(d&&d.fetched_at)||"",
+    known:known
+  };
+}
+// 进度条配色与 workbuddy 一致：<=60% 绿，>60% 黄，>85% 红。
+function pbColor(pct){var c='var(--ok)';if(pct>60)c='var(--warn)';if(pct>85)c='var(--err)';return c}
+function whenText(fetched){return fetched?(' · 快照 '+esc(String(fetched).replace('T',' ').replace('Z',' UTC'))):''}
+// progressHTML 卡片用量条：可用 X / 已用 Y · Z% + 进度条 + 明细行（同 workbuddy）。
+function progressHTML(c){
+  if(!c||!c.known){
+    return '<div class="pb"><div class="pb-label"><span>可用积分</span><span><span class="spin"></span>加载中…</span></div>'+
+           '<div class="pb-track"><div class="pb-bar" style="width:0%"></div></div></div>';
+  }
+  var total=c.size>0?c.size:(c.remain+c.used);
+  var pct=total>0?Math.round(c.used/total*100):0;
+  return '<div class="pb">'+
+    '<div class="pb-label"><span>可用 '+c.remain+'</span><span>已用 '+c.used+' · '+pct+'%</span></div>'+
+    '<div class="pb-track"><div class="pb-bar" style="width:'+pct+'%;background:'+pbColor(pct)+'"></div></div>'+
+    '<div class="pb-meta">剩余 '+c.remain+' · 已用 '+c.used+' · 额度池 '+total+
+      (c.packs?(' · '+c.packs+' 个包'):'')+whenText(c.fetched)+
+    '</div></div>';
+}
 function statusOf(a){
   if(!a)return "error";
   if(a.disabled)return "disabled";
@@ -350,12 +390,10 @@ function card(a){
   var refreshBtn='<button class="sec" data-action="refresh" data-auth-index="'+esc(a.auth_index)+'" title="重新查询该账号积分">刷新</button>';
   var keepaliveBtn='<button class="sec" data-action="keepalive" data-auth-index="'+esc(a.auth_index)+'" title="刷新该账号 access token">Token</button>';
   var badges=(selected?'<span class="badge active">使用中</span>':'')+statusBadge(a);
-  var creditVal=hasCredits(a)?esc(a.credits):'—';
-  var creditCls=hasCredits(a)?(a.credits>0?"ok":"warn"):"";
   return '<div class="card'+(selected?" selected":"")+'" data-status="'+st+'" data-auth="'+esc(a.auth_index)+'">\n'+
   '  <h2>'+esc(a.nickname||a.label||a.name||"—")+' <span style="display:flex;gap:6px;align-items:center">'+badges+'</span></h2>\n'+
   '  <div class="uid">'+esc(a.uid||"—")+' · '+esc(a.name||"")+'</div>\n'+
-  '  <div class="summary-item"><div class="k">剩余积分</div><div class="v '+creditCls+'">'+creditVal+'</div></div>\n'+
+  progressHTML(creditsOf(a))+'\n'+
   (a.error?'  <div class="row"><span class="k">错误</span><span class="v err">'+esc(a.error)+'</span></div>\n':'')+
   '  <div class="actions">'+selectBtn+checkinBtn+refreshBtn+keepaliveBtn+'</div>\n'+
   '  </div>';
@@ -406,13 +444,19 @@ function renderSummary(accounts){
   var all=accounts||[];
   if(!all.length){box.style.display="none";box.innerHTML="";return}
   var scoped=accountsForFilter(all);
-  var okN=0,coolN=0,errN=0,disN=0,total=0,readable=0;
+  var okN=0,coolN=0,errN=0,disN=0,readable=0;
+  var remain=0,used=0,size=0,packs=0;
   scoped.forEach(function(a){
     var st=statusOf(a);
     if(st==="ok")okN++;else if(st==="cooling")coolN++;else if(st==="error")errN++;else disN++;
-    if(hasCredits(a)){total+=Number(a.credits)||0;readable++}
+    var c=creditsOf(a);
+    if(c.known){remain+=c.remain;used+=c.used;size+=c.size;packs+=c.packs;readable++}
   });
-  var pct=scoped.length?Math.round(readable/scoped.length*100):0;
+  // 消耗占比：已用 / 额度池（池未知时退回 remain+used）。同 workbuddy 口径。
+  var pool=size>0?size:(remain+used);
+  var usedPct=pool>0?Math.round(used/pool*100):0;
+  var pbCls=usedPct>85?"err":(usedPct>60?"warn":"ok");
+  var readPct=scoped.length?Math.round(readable/scoped.length*100):0;
   var scopeLabel=currentFilter==="all"?"全部账号":
     (currentFilter==="ok"?"可用":currentFilter==="cooling"?"冷却中":currentFilter==="error"?"异常":"已禁用")+" 账号";
   var v=versionInfo||{};
@@ -439,11 +483,23 @@ function renderSummary(accounts){
       '<div class="summary-item"><div class="k">冷却中</div><div class="v warn">'+coolN+'</div></div>'+
       '<div class="summary-item"><div class="k">异常</div><div class="v err">'+errN+'</div></div>'+
       '<div class="summary-item"><div class="k">已禁用</div><div class="v">'+disN+'</div></div>'+
-      '<div class="summary-item"><div class="k">剩余积分</div><div class="v">'+total+'</div></div>'+
+    '</div>'+
+    '<div class="summary-grid">'+
+      '<div class="summary-item"><div class="k">剩余(可用)</div><div class="v ok">'+remain+'</div></div>'+
+      '<div class="summary-item"><div class="k">已用(消耗)</div><div class="v '+pbCls+'">'+used+'</div></div>'+
+      '<div class="summary-item"><div class="k">额度池</div><div class="v">'+(pool||'—')+'</div></div>'+
+      '<div class="summary-item"><div class="k">消耗占比</div><div class="v '+(pool?(usedPct>85?"err":(usedPct>60?"warn":"ok")):"")+'">'+(pool?usedPct+'%':'—')+'</div></div>'+
     '</div>'+
     '<div class="pb">'+
-      '<div class="pb-label"><span>积分可读率</span><span>'+pct+'%</span></div>'+
-      '<div class="pb-track"><div class="pb-bar" style="width:'+pct+'%;background:var(--acc)"></div></div>'+
+      '<div class="pb-label"><span>消耗进度（已用/额度池）</span><span>'+(pool?usedPct+'%':'—')+'</span></div>'+
+      '<div class="pb-track"><div class="pb-bar" style="width:'+(pool?usedPct:0)+'%;background:'+pbColor(usedPct)+'"></div></div>'+
+      '<div class="pb-meta">可用 '+remain+' · 已用 '+used+' · 池 '+pool+
+        (packs?(' · '+packs+' 个包'):'')+
+        '（签到加包会抬高池和可用，不等于没消耗）</div>'+
+    '</div>'+
+    '<div class="pb">'+
+      '<div class="pb-label"><span>积分可读率</span><span>'+readPct+'%</span></div>'+
+      '<div class="pb-track"><div class="pb-bar" style="width:'+readPct+'%;background:var(--acc)"></div></div>'+
       '<div class="pb-meta">'+readable+' / '+scoped.length+' 个账号返回了积分'+(scoped.length!==all.length?('（全部 '+all.length+' 个）'):'')+'</div>'+
     '</div>'+
     '<div class="row"><span class="k">调度</span><span class="v">'+schedText+'</span></div>'+
@@ -483,7 +539,7 @@ async function refreshMeta(){
     var el=document.getElementById('autoToggle');
     if(el)el.checked=!!statusInfo.checkin_auto;
     var sv=document.getElementById('svtime');
-    if(sv)sv.textContent='调度 '+(statusInfo.scheduler_mode||'—');
+    if(sv&&statusInfo.server_time)sv.textContent='服务器时间 '+statusInfo.server_time;
   }catch(e){/* 元数据失败不阻塞账号渲染 */}
 }
 
@@ -653,10 +709,18 @@ async function refreshOne(idx,btn){
     var a=lastAccounts.find(function(x){return x.auth_index===idx});
     if(a){
       if(acct.credits!==null&&acct.credits!==undefined)a.credits=acct.credits;
+      if(acct.credits_detail)a.credits_detail=acct.credits_detail;
+      else if(acct.credits_total||acct.credits_used||acct.pack_count){
+        a.credits_detail={total_remain:Number(acct.credits)||0,
+          total_used:Number(acct.credits_used)||0,
+          total_size:Number(acct.credits_total)||0,
+          pack_count:Number(acct.pack_count)||0};
+      }
       if(acct.error)a.error=acct.error;else a.error="";
       updateOneCard(a);
     }
-    toast("积分已刷新","ok",(acct.nickname||idx)+" · 剩余 "+(acct.credits!=null?acct.credits:"—"));
+    var remain=(acct.credits_detail&&acct.credits_detail.total_remain!=null)?acct.credits_detail.total_remain:acct.credits;
+    toast("积分已刷新","ok",(acct.nickname||idx)+" · 剩余 "+(remain!=null?remain:"—"));
   }catch(e){
     toast("刷新失败","err",(e&&e.message)||String(e));
   }finally{busy(btn,false)}

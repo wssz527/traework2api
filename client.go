@@ -434,17 +434,20 @@ func (c *Client) CheckinClaim(a *traeAuth) error {
 	return nil
 }
 
-// UserEntUsage 聚合剩余积分（ide_user_ent_usage）。
-// 剩余 = Σ(credits_limit) − Σ(usage.credits_amount)。
-func (c *Client) UserEntUsage(a *traeAuth) (remain int64, err error) {
+// UserEntUsage 聚合积分用量（ide_user_ent_usage）。
+//
+// 剩余 = Σ(credits_limit) − Σ(usage.credits_amount)，钳到 >= 0；
+// used/limit/pack_count 一并返回，面板据此画用量进度条。
+func (c *Client) UserEntUsage(a *traeAuth) (entUsage, error) {
+	var zero entUsage
 	req, err := http.NewRequest(http.MethodPost, c.ugBase()+EpEntUsage, bytes.NewReader([]byte("{}")))
 	if err != nil {
-		return 0, err
+		return zero, err
 	}
 	UgHeaders(req, a)
 	data, err := c.doJSON(req)
 	if err != nil {
-		return 0, err
+		return zero, err
 	}
 	var resp struct {
 		IsCreditsBilling        bool `json:"is_credits_billing"`
@@ -460,18 +463,23 @@ func (c *Client) UserEntUsage(a *traeAuth) (remain int64, err error) {
 		} `json:"user_entitlement_pack_list"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
-		return 0, fmt.Errorf("ent usage parse: %w", err)
+		return zero, fmt.Errorf("ent usage parse: %w", err)
 	}
 	var limit, used float64
 	for _, p := range resp.UserEntitlementPackList {
 		limit += float64(p.EntitlementBaseInfo.Quota.CreditsLimit)
 		used += p.Usage.CreditsAmount
 	}
-	remain = int64(limit - used)
-	if remain < 0 {
-		remain = 0
+	out := entUsage{
+		Used:      int64(used),
+		Limit:     int64(limit),
+		PackCount: len(resp.UserEntitlementPackList),
 	}
-	return remain, nil
+	out.Remain = int64(limit - used)
+	if out.Remain < 0 {
+		out.Remain = 0
+	}
+	return out, nil
 }
 
 // GetUserInfo 查询账号信息（登录用）。

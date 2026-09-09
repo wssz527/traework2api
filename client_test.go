@@ -255,12 +255,15 @@ func TestUserEntUsageAggregation(t *testing.T) {
 			{"entitlement_base_info":{"quota":{"credits_limit":500}},"usage":{"credits_amount":0}}
 		]}`), nil
 	})
-	remain, err := c.UserEntUsage(fakeAuth())
+	u, err := c.UserEntUsage(fakeAuth())
 	if err != nil {
 		t.Fatalf("ent usage: %v", err)
 	}
-	if remain != 2500 {
-		t.Errorf("remain=%d want 2500", remain)
+	if u.Remain != 2500 {
+		t.Errorf("remain=%d want 2500", u.Remain)
+	}
+	if u.Limit != 2500 || u.Used != 0 || u.PackCount != 2 {
+		t.Errorf("limit/used/packs=%d/%d/%d want 2500/0/2", u.Limit, u.Used, u.PackCount)
 	}
 }
 
@@ -272,12 +275,34 @@ func TestUserEntUsageSubtractsUsed(t *testing.T) {
 			{"entitlement_base_info":{"quota":{"credits_limit":500}},"usage":{"credits_amount":100}}
 		]}`), nil
 	})
-	remain, err := c.UserEntUsage(fakeAuth())
+	u, err := c.UserEntUsage(fakeAuth())
 	if err != nil {
 		t.Fatalf("ent usage: %v", err)
 	}
-	if remain != 1649 { // 2500 - 850.5 → 1649.5 → 截断为 1649
-		t.Errorf("remain=%d want 1649", remain)
+	if u.Remain != 1649 { // 2500 - 850.5 → 1649.5 → 截断为 1649
+		t.Errorf("remain=%d want 1649", u.Remain)
+	}
+	if u.Limit != 2500 {
+		t.Errorf("limit=%d want 2500", u.Limit)
+	}
+	if u.Used != 850 { // 750.5 + 100 → 850.5 → 截断为 850
+		t.Errorf("used=%d want 850", u.Used)
+	}
+}
+
+// TestUserEntUsageProgressRatio 面板进度条依赖 used/limit，不能只有 remain。
+func TestUserEntUsageProgressRatio(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"user_entitlement_pack_list":[
+			{"entitlement_base_info":{"quota":{"credits_limit":1000}},"usage":{"credits_amount":250}}
+		]}`), nil
+	})
+	u, err := c.UserEntUsage(fakeAuth())
+	if err != nil {
+		t.Fatalf("ent usage: %v", err)
+	}
+	if u.Remain != 750 || u.Used != 250 || u.Limit != 1000 || u.PackCount != 1 {
+		t.Errorf("got %+v want remain=750 used=250 limit=1000 packs=1", u)
 	}
 }
 
@@ -287,12 +312,16 @@ func TestUserEntUsageClampsNegative(t *testing.T) {
 			{"entitlement_base_info":{"quota":{"credits_limit":100}},"usage":{"credits_amount":900}}
 		]}`), nil
 	})
-	remain, err := c.UserEntUsage(fakeAuth())
+	u, err := c.UserEntUsage(fakeAuth())
 	if err != nil {
 		t.Fatalf("ent usage: %v", err)
 	}
-	if remain != 0 {
-		t.Errorf("remain=%d want 0 (clamped)", remain)
+	if u.Remain != 0 {
+		t.Errorf("remain=%d want 0 (clamped)", u.Remain)
+	}
+	// used/limit 不被钳制：面板要按真实用量显示 900/100。
+	if u.Used != 900 || u.Limit != 100 {
+		t.Errorf("used/limit=%d/%d want 900/100", u.Used, u.Limit)
 	}
 }
 

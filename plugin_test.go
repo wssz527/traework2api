@@ -875,3 +875,57 @@ func TestRegistrationVersionNoLeadingV(t *testing.T) {
 		t.Errorf("version %q must start with a digit", v)
 	}
 }
+
+// TestCreditsUsageRoundTrip 用量明细（used/limit/pack_count）必须随缓存往返，
+// 否则面板进度条在缓存命中时会退化成只有 remain。
+func TestCreditsUsageRoundTrip(t *testing.T) {
+	id := "usage-roundtrip"
+	defer invalidateCredits(id)
+	at := time.Now().UTC().Truncate(time.Second)
+	storeCreditsUsage(id, entUsage{Remain: 750, Used: 250, Limit: 1000, PackCount: 3}, at)
+
+	cr, ok := cachedCreditsSummary(id)
+	if !ok {
+		t.Fatal("cache miss after store")
+	}
+	if cr.TotalRemain != 750 || cr.TotalUsed != 250 || cr.TotalSize != 1000 || cr.PackCount != 3 {
+		t.Errorf("summary=%+v want 750/250/1000/3", cr)
+	}
+	if cr.FetchedAt != at.Format(time.RFC3339) {
+		t.Errorf("fetched_at=%q want %q", cr.FetchedAt, at.Format(time.RFC3339))
+	}
+	u, ok := cachedCreditsUsage(id)
+	if !ok {
+		t.Fatal("cachedCreditsUsage miss")
+	}
+	if u.Remain != 750 || u.Used != 250 || u.Limit != 1000 || u.PackCount != 3 {
+		t.Errorf("usage=%+v want 750/250/1000/3", u)
+	}
+	if remain, ok := cachedCredits(id); !ok || remain != 750 {
+		t.Errorf("cachedCredits=%d,%v want 750,true", remain, ok)
+	}
+	// 老签名 storeCredits 只写 remain，其余字段应为 0 而不是残留旧值。
+	other := "usage-roundtrip-legacy"
+	defer invalidateCredits(other)
+	storeCredits(other, 42, at)
+	cr2, _ := cachedCreditsSummary(other)
+	if cr2.TotalRemain != 42 || cr2.TotalUsed != 0 || cr2.TotalSize != 0 || cr2.PackCount != 0 {
+		t.Errorf("legacy summary=%+v want 42/0/0/0", cr2)
+	}
+}
+
+// TestStatusIncludesServerTime 面板顶部要显示服务器时间（对齐 workbuddy）。
+func TestStatusIncludesServerTime(t *testing.T) {
+	st := handleStatus()
+	raw, ok := st["server_time"].(string)
+	if !ok || raw == "" {
+		t.Fatalf("server_time missing: %#v", st)
+	}
+	if _, err := time.Parse("2006-01-02 15:04:05", raw); err != nil {
+		t.Errorf("server_time %q not in 'YYYY-MM-DD HH:MM:SS': %v", raw, err)
+	}
+	date, ok := st["server_date"].(string)
+	if !ok || len(date) != len("2006-01-02") {
+		t.Errorf("server_date=%q", date)
+	}
+}

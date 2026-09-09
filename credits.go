@@ -12,8 +12,20 @@ import (
 // accountCacheTTL 积分缓存时长。
 const accountCacheTTL = 5 * time.Minute
 
+// entUsage 一次积分查询的结果（remain 已钳到 >= 0）。
+type entUsage struct {
+	Remain    int64
+	Used      int64
+	Limit     int64
+	PackCount int
+}
+
+// creditsSummary 积分快照（脱敏：只有数字与包个数，不含任何凭证）。
 type creditsSummary struct {
 	TotalRemain int64  `json:"total_remain"`
+	TotalUsed   int64  `json:"total_used,omitempty"`
+	TotalSize   int64  `json:"total_size,omitempty"`
+	PackCount   int    `json:"pack_count,omitempty"`
 	FetchedAt   string `json:"fetched_at,omitempty"`
 }
 
@@ -26,27 +38,62 @@ var accountCache sync.Map // authID -> *accountCacheEntry
 
 // storeCredits 写入积分快照（脱敏：只存数字，不含 token）。
 func storeCredits(authID string, remain int64, at time.Time) {
+	storeCreditsUsage(authID, entUsage{Remain: remain}, at)
+}
+
+// storeCreditsUsage 写入完整用量快照（remain/used/limit/pack_count）。
+func storeCreditsUsage(authID string, u entUsage, at time.Time) {
 	authID = strings.TrimSpace(authID)
 	if authID == "" {
 		return
 	}
 	accountCache.Store(authID, &accountCacheEntry{
-		credits: &creditsSummary{TotalRemain: remain, FetchedAt: at.UTC().Format(time.RFC3339)},
+		credits: &creditsSummary{
+			TotalRemain: u.Remain,
+			TotalUsed:   u.Used,
+			TotalSize:   u.Limit,
+			PackCount:   u.PackCount,
+			FetchedAt:   at.UTC().Format(time.RFC3339),
+		},
 		fetched: at,
 	})
 }
 
 // cachedCredits 读取缓存的剩余积分；ok=false 表示未知。
 func cachedCredits(authID string) (int64, bool) {
-	v, ok := accountCache.Load(strings.TrimSpace(authID))
+	cr, ok := cachedCreditsSummary(authID)
 	if !ok {
 		return 0, false
 	}
+	return cr.TotalRemain, true
+}
+
+// cachedCreditsUsage 读取缓存的完整用量快照；ok=false 表示未知。
+func cachedCreditsUsage(authID string) (entUsage, bool) {
+	cr, ok := cachedCreditsSummary(authID)
+	if !ok {
+		return entUsage{}, false
+	}
+	return entUsage{
+		Remain:    cr.TotalRemain,
+		Used:      cr.TotalUsed,
+		Limit:     cr.TotalSize,
+		PackCount: cr.PackCount,
+	}, true
+}
+
+// cachedCreditsSummary 读取缓存的原始快照（含 fetched_at）；ok=false 表示未
+// 知或已过期。返回的是缓存内部的指针，调用方不得修改。
+func cachedCreditsSummary(authID string) (*creditsSummary, bool) {
+	v, ok := accountCache.Load(strings.TrimSpace(authID))
+	if !ok {
+		return nil, false
+	}
 	e, ok := v.(*accountCacheEntry)
 	if !ok || e.credits == nil || time.Since(e.fetched) > accountCacheTTL {
-		return 0, false
+		return nil, false
 	}
-	return e.credits.TotalRemain, true
+	return e.credits, true
 }
 
 // invalidateCredits 让某账号的积分缓存失效（聊天成功后调用）。
@@ -70,9 +117,30 @@ type traeAccount struct {
 	Status    string `json:"status,omitempty"`
 	Disabled  bool   `json:"disabled"`
 	Cooling   bool   `json:"cooling"`
-	Credits   *int64 `json:"credits,omitempty"`
-	Selected  bool   `json:"selected"`
-	Error     string `json:"error,omitempty"`
+	// Credits 保留：只查剩余的老调用方与面板兼容字段。
+	Credits   *int64         `json:"credits,omitempty"`
+	CreditsEx *creditsDetail `json:"credits_detail,omitempty"`
+	Selected  bool           `json:"selected"`
+	Error     string         `json:"error,omitempty"`
+}
+
+// creditsDetail 账号用量明细（面板进度条；脱敏：只有数字）。
+type creditsDetail struct {
+	TotalRemain int64  `json:"total_remain"`
+	TotalUsed   int64  `json:"total_used,omitempty"`
+	TotalSize   int64  `json:"total_size,omitempty"`
+	PackCount   int    `json:"pack_count,omitempty"`
+	FetchedAt   string `json:"fetched_at,omitempty"`
+}
+
+func newCreditsDetail(u entUsage, at time.Time) *creditsDetail {
+	return &creditsDetail{
+		TotalRemain: u.Remain,
+		TotalUsed:   u.Used,
+		TotalSize:   u.Limit,
+		PackCount:   u.PackCount,
+		FetchedAt:   at.UTC().Format(time.RFC3339),
+	}
 }
 
 // buildAccounts 组装账号列表（脱敏 + 积分缓存）。
@@ -133,14 +201,25 @@ func buildOneAccount(f pluginapi.HostAuthFileEntry, force bool) traeAccount {
 	a.Nickname = sa.Nickname
 	a.UID = maskUID(sa.UID)
 	a.Cooling = isCooling(f.AuthIndex)
-	if remain, ok := cachedCredits(f.ID); ok && !force {
-		v := remain
+	// 缓存命中也带完整明细：used/limit/pack_count/快照时间都在缓存里。
+	if cr, ok := cachedCreditsSummary(f.ID); ok && !force {
+		v := cr.TotalRemain
 		a.Credits = &v
+		a.CreditsEx = &creditsDetail{
+			TotalRemain: cr.TotalRemain,
+			TotalUsed:   cr.TotalUsed,
+			TotalSize:   cr.TotalSize,
+			PackCount:   cr.PackCount,
+			FetchedAt:   cr.FetchedAt,
+		}
 		return a
 	}
-	if remain, err := currentClient().UserEntUsage(sa); err == nil {
-		a.Credits = &remain
-		storeCredits(f.ID, remain, time.Now())
+	if u, err := currentClient().UserEntUsage(sa); err == nil {
+		v := u.Remain
+		a.Credits = &v
+		now := time.Now()
+		a.CreditsEx = newCreditsDetail(u, now)
+		storeCreditsUsage(f.ID, u, now)
 	}
 	return a
 }

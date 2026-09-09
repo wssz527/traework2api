@@ -104,10 +104,10 @@ func checkinOneAccount(f pluginapi.HostAuthFileEntry) map[string]any {
 	}
 
 	// 查积分（签到就是为了补充积分；结果用于面板与冷却解冻）
-	if remain, qerr := currentClient().UserEntUsage(sa); qerr == nil {
-		out["credits"] = remain
-		storeCredits(f.ID, remain, time.Now())
-		if remain > 0 {
+	if u, qerr := currentClient().UserEntUsage(sa); qerr == nil {
+		out["credits"] = u.Remain
+		storeCreditsUsage(f.ID, u, time.Now())
+		if u.Remain > 0 {
 			unfreezeIfCooled(f.AuthIndex, sa)
 		}
 	} else if _, ok := out["credits"]; !ok {

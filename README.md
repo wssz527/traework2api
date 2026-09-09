@@ -127,15 +127,15 @@ c-shared **没有进程隔离**——一个 panic 会拖垮整个 CPA 进程（8
 
 | Method | Path | 说明 |
 |---|---|---|
-| GET | `/accounts` | 账号列表（UID 脱敏）、积分、冷却/禁用状态、当前选中 |
+| GET | `/accounts` | 账号列表（UID 脱敏）、积分、冷却/禁用状态、当前选中；每账号带 `credits_detail`（`total_remain`/`total_used`/`total_size`/`pack_count`/`fetched_at`）供面板画用量进度条 |
 | POST | `/refresh` | 强制刷新全部账号积分 |
 | POST | `/checkin` | 签到：body `{auth_index}` 单号，留空全量 |
 | POST | `/checkin/config` | 开关自动签到 / 设 `checkin_hour`（运行时生效，重启回落到 config.yaml） |
-| GET | `/credits` | 积分查询：`?auth_index=` 单号，留空全量 |
+| GET | `/credits` | 积分查询：`?auth_index=` 单号，留空全量；带 `credits_total`/`credits_used`/`pack_count`/`credits_detail` 用量明细 |
 | POST | `/import` | 导入凭证 JSON（嵌套/扁平均可）到宿主 auth store |
 | POST | `/select` | 切换 active auth（chat 路由优先账号） |
 | POST | `/keepalive` | 手动刷新 token（单号或全量） |
-| GET | `/status` | 调度器与生命周期配置 |
+| GET | `/status` | 调度器与生命周期配置，含 `server_time`（`YYYY-MM-DD HH:MM:SS`） |
 | GET | `/version` | 上游版本跟踪：当前值、内置值、缓存状态、源列表 |
 | POST | `/version/refresh` | 强制重新探测上游版本（后台执行，不阻塞） |
 

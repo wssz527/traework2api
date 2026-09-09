@@ -299,11 +299,15 @@ func handleCreditsQuery(req pluginapi.ManagementRequest) map[string]any {
 		return map[string]any{"error": err.Error()}
 	}
 	type acctCredits struct {
-		AuthIndex string `json:"auth_index"`
-		Nickname  string `json:"nickname,omitempty"`
-		UID       string `json:"uid,omitempty"`
-		Credits   *int64 `json:"credits,omitempty"`
-		Error     string `json:"error,omitempty"`
+		AuthIndex    string         `json:"auth_index"`
+		Nickname     string         `json:"nickname,omitempty"`
+		UID          string         `json:"uid,omitempty"`
+		Credits      *int64         `json:"credits,omitempty"`
+		CreditsTotal int64          `json:"credits_total,omitempty"`
+		CreditsUsed  int64          `json:"credits_used,omitempty"`
+		PackCount    int            `json:"pack_count,omitempty"`
+		CreditsEx    *creditsDetail `json:"credits_detail,omitempty"`
+		Error        string         `json:"error,omitempty"`
 	}
 	var out []acctCredits
 	for _, f := range files {
@@ -316,11 +320,17 @@ func handleCreditsQuery(req pluginapi.ManagementRequest) map[string]any {
 			continue
 		}
 		ac := acctCredits{AuthIndex: f.AuthIndex, Nickname: sa.Nickname, UID: maskUID(sa.UID)}
-		if remain, qerr := currentClient().UserEntUsage(sa); qerr != nil {
+		if u, qerr := currentClient().UserEntUsage(sa); qerr != nil {
 			ac.Error = redactSecrets(qerr.Error())
 		} else {
+			remain := u.Remain
 			ac.Credits = &remain
-			storeCredits(f.ID, remain, nowUTC())
+			ac.CreditsTotal = u.Limit
+			ac.CreditsUsed = u.Used
+			ac.PackCount = u.PackCount
+			now := nowUTC()
+			ac.CreditsEx = newCreditsDetail(u, now)
+			storeCreditsUsage(f.ID, u, now)
 		}
 		out = append(out, ac)
 	}
@@ -356,6 +366,7 @@ func handleKeepalive(req pluginapi.ManagementRequest) map[string]any {
 
 // handleStatus GET /status：调度器与生命周期配置。
 func handleStatus() map[string]any {
+	now := nowUTC()
 	return map[string]any{
 		"provider":       providerName,
 		"version":        version,
@@ -365,6 +376,8 @@ func handleStatus() map[string]any {
 		"scheduler_mode": loadedSchedulerMode(),
 		"lifecycle_auto": lifecycleEnabled(),
 		"active_auth":    getActiveAuthID(),
+		"server_time":    now.Format("2006-01-02 15:04:05"),
+		"server_date":    now.Format("2006-01-02"),
 	}
 }
 
