@@ -102,12 +102,19 @@ func setRefreshHours(hours []int) {
 // mode=credits 时做会话级粘性+分摊：已绑定会话在其账号可用时钉住不动
 // （对齐面板选中态）；新会话选「活跃绑定最少」的账号，把并发会话隔到不同
 // 账号的并发位上。无会话信号的请求退回 pickActiveAuth（面板粘性）。
+//
+// 宿主的 scheduler.pick 是全局单槽（先注册者赢），请求可能带其他 provider
+// 的候选集（mixed 路由 Provider 为空）；非本 provider 的请求一律 defer，
+// 且粘性键带 provider 前缀，避免与其他插件的绑定表串号。
 func handleSchedulerPick(raw []byte) ([]byte, error) {
 	var req pluginapi.SchedulerPickRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
 	if loadedSchedulerMode() != schedulerModeCredits {
+		return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
+	}
+	if !pickTargetsTrae(&req) {
 		return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
 	}
 	var cands []activeAuthCandidate
@@ -153,6 +160,21 @@ func handleSchedulerPick(raw []byte) ([]byte, error) {
 		stickyBind(sessionKey, picked, now)
 	}
 	return okEnvelope(pluginapi.SchedulerPickResponse{AuthID: picked, Handled: true})
+}
+
+// pickTargetsTrae 判断该 pick 请求是否面向 trae：Provider 为空视为 mixed
+// 路由，只有候选集里全是 trae 时才处理；否则只要 Provider 含 trae 即处理。
+func pickTargetsTrae(req *pluginapi.SchedulerPickRequest) bool {
+	p := strings.ToLower(strings.TrimSpace(req.Provider))
+	if p != "" {
+		return p == providerName
+	}
+	for _, c := range req.Candidates {
+		if !strings.EqualFold(strings.TrimSpace(c.Provider), providerName) {
+			return false
+		}
+	}
+	return len(req.Candidates) > 0
 }
 
 // candidateDisabled 从 Status/metadata 判断宿主侧禁用。

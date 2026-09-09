@@ -115,6 +115,11 @@ func TestModelForAuthNegativeCacheNoRepeatedFetch(t *testing.T) {
 		t.Fatalf("fresh negative cache should hit with empty models: ok=%v m=%v", ok, m)
 	}
 	sa, _ := parseStored(storageOf())
+	// 负缓存命中也不应清空模型表：必须回退静态表（否则宿主注销全部模型）。
+	fallback := fetchDynamicModels(sa)
+	if len(fallback) == 0 {
+		t.Fatalf("negative cache must fall back to static models, got %d", len(fallback))
+	}
 	fetchDynamicModels(sa) // 不应发起任何上游请求（负缓存 TTL 内不算 miss）
 	if got := testUpstreamModelsHits.Load(); got != 0 {
 		t.Errorf("negative cache should prevent upstream fetch, got %d hits", got)

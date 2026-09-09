@@ -96,6 +96,60 @@ func TestMarshalNestedRoundtrip(t *testing.T) {
 	}
 }
 
+// setDisabledForTest 复现 persistAuth 写内存态的前半段（宿主 save 在单测中不可用）。
+func setDisabledForTest(t *testing.T, a *traeAuth, disabled bool) {
+	t.Helper()
+	a.mu.Lock()
+	a.Disabled = disabled
+	a.mu.Unlock()
+}
+
+// TestDisabledPersisted 冷却/禁用写盘必须真正落 disabled:true——之前
+// marshalNested 硬编码 false，宿主凭证里的禁用标记被任意一次写盘抹掉。
+func TestDisabledPersisted(t *testing.T) {
+	a, err := parseStored([]byte(existingFormat))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Disabled {
+		t.Fatal("fresh parse should not be disabled")
+	}
+	// 序列化跟随内存态：persistAuth(false) → false，persistAuth(true)（冷却
+	// 路径）→ true。宿主 RPC 在单测里不可用，只验证 JSON 形状与重解析。
+	setDisabledForTest(t, a, false)
+	raw1, err := a.marshalNested()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var top1 struct {
+		Disabled bool `json:"disabled"`
+	}
+	_ = json.Unmarshal(raw1, &top1)
+	if top1.Disabled {
+		t.Error("disabled should be false after persistAuth(false)")
+	}
+	setDisabledForTest(t, a, true)
+	raw2, err := a.marshalNested()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var top2 struct {
+		Disabled bool `json:"disabled"`
+	}
+	_ = json.Unmarshal(raw2, &top2)
+	if !top2.Disabled {
+		t.Error("disabled should be true after persistAuth(true)")
+	}
+	// parse 回来也要带上 disabled（宿主重启后重新加载凭证）。
+	b, err := parseStored(raw2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !b.Disabled {
+		t.Error("disabled flag lost on reparse")
+	}
+}
+
 func TestNeedsRefresh(t *testing.T) {
 	a := &traeAuth{ExpiresAt: 0}
 	if !a.NeedsRefresh(0) {

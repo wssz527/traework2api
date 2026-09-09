@@ -64,15 +64,15 @@ func TestStickySessionKeyPriority(t *testing.T) {
 			Headers: map[string][]string{"X-Session-ID": {"hdr-1"}},
 		},
 	}
-	if got := stickySessionKey(req); got != "exec:exec-1" {
+	if got := stickySessionKey(req); got != providerName+"|exec:exec-1" {
 		t.Fatalf("execution id 应优先, got %q", got)
 	}
 	delete(req.Options.Metadata, "execution_session_id")
-	if got := stickySessionKey(req); got != "derived:derived-1" {
+	if got := stickySessionKey(req); got != providerName+"|derived:derived-1" {
 		t.Fatalf("derived id 次之, got %q", got)
 	}
 	delete(req.Options.Metadata, "derived_session_id")
-	if got := stickySessionKey(req); got != "hdr:x-session-id:hdr-1" {
+	if got := stickySessionKey(req); got != providerName+"|hdr:x-session-id:hdr-1" {
 		t.Fatalf("header 兜底, got %q", got)
 	}
 	req.Options.Headers = nil
@@ -193,13 +193,52 @@ func TestStickyPickExpiresAfterIdleTTL(t *testing.T) {
 		t.Fatalf("首请求应选 a, got %q", resp.AuthID)
 	}
 	stickySessions.Lock()
-	stickySessions.m["derived:s-1"].lastSeen = time.Now().Add(-stickyTTL - time.Minute)
+	stickySessions.m[providerName+"|derived:s-1"].lastSeen = time.Now().Add(-stickyTTL - time.Minute)
 	stickySessions.Unlock()
 	// a 的绑定已过期 → 按绑定数重新分摊：a 0 个（已过期不计）、b 0 个 → 顺序选 a
 	// 再绑一个会话占住 a，过期会话重选时应落到 b
-	stickyBind("derived:s-2", "a", time.Now())
+	stickyBind(providerName+"|derived:s-2", "a", time.Now())
 	resp := pickWithSession(t, sess, "a", "b")
 	if resp.AuthID != "b" {
 		t.Fatalf("过期绑定应重新分摊到 b, got %q", resp.AuthID)
+	}
+}
+
+// 非 trae 请求（mixed 路由把候选集全量下发）必须 defer，不得返回 trae 账号。
+func TestSchedulerPickDefersNonTraeRequest(t *testing.T) {
+	resetSticky(t)
+	cands := []pluginapi.SchedulerAuthCandidate{
+		{ID: "trae-a", Provider: providerName},
+		{ID: "wb-a", Provider: "workbuddy"},
+	}
+	// 宿主 mixed 路由：Provider 为空、候选集混合。
+	body, _ := json.Marshal(pluginapi.SchedulerPickRequest{
+		Provider:   "",
+		Options:    pluginapi.SchedulerOptions{Metadata: map[string]any{"derived_session_id": "s-x"}},
+		Candidates: cands,
+	})
+	raw, err := handleMethodGuarded("scheduler.pick", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp pluginapi.SchedulerPickResponse
+	_ = json.Unmarshal(mustDecodeResult(t, raw), &resp)
+	if resp.Handled {
+		t.Fatalf("mixed 路由不应处理: %+v", resp)
+	}
+
+	// 请求 Provider 指向其他 provider 时同样 defer。
+	body2, _ := json.Marshal(pluginapi.SchedulerPickRequest{
+		Provider:   "workbuddy",
+		Candidates: cands,
+	})
+	raw2, err := handleMethodGuarded("scheduler.pick", body2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp2 pluginapi.SchedulerPickResponse
+	_ = json.Unmarshal(mustDecodeResult(t, raw2), &resp2)
+	if resp2.Handled {
+		t.Fatalf("workbuddy 请求不应处理: %+v", resp2)
 	}
 }

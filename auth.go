@@ -36,6 +36,10 @@ type traeAuth struct {
 	UID                string
 	EnterpriseID       string
 	Nickname           string
+
+	// Disabled 与宿主凭证文件顶层 disabled 同步：冷却/禁用写盘时为 true，
+	// 否则每次重写凭证都会把宿主的 disabled 抹回 false（冷却跨重启失效）。
+	Disabled bool
 }
 
 // Lock 供改写 Auth 字段期间加写锁。
@@ -117,6 +121,7 @@ func parseNested(raw []byte) (*traeAuth, error) {
 		UID:                n.Account.UID,
 		EnterpriseID:       n.Account.EnterpriseID,
 		Nickname:           n.Account.Nickname,
+		Disabled:           parseDisabledFromAuthJSON(raw),
 	}, nil
 }
 
@@ -154,6 +159,7 @@ func parseFlat(raw []byte) (*traeAuth, error) {
 		UID:                f.UID,
 		EnterpriseID:       f.EnterpriseID,
 		Nickname:           f.Nickname,
+		Disabled:           parseDisabledFromAuthJSON(raw),
 	}, nil
 }
 
@@ -211,5 +217,5 @@ func (a *traeAuth) marshalNested() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return authFileJSON(raw, false)
+	return authFileJSON(raw, a.Disabled)
 }

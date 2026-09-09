@@ -51,24 +51,25 @@ var stickySessions = struct {
 
 // stickySessionKey 从 pick 请求提取稳定会话标识。
 // 优先级：execution_session_id > derived_session_id > 显式会话头。
-// 无任何会话信号时返回 ""（该请求不参与粘性）。
+// 无任何会话信号时返回 ""（该请求不参与粘性）。键带 provider 前缀，
+// 宿主调度是全局单槽，跨插件不得共用绑定表。
 func stickySessionKey(req *pluginapi.SchedulerPickRequest) string {
 	if req == nil {
 		return ""
 	}
 	if v, ok := req.Options.Metadata[stickyMetadataKeyExecution].(string); ok {
 		if v = strings.TrimSpace(v); v != "" {
-			return "exec:" + v
+			return providerName + "|exec:" + v
 		}
 	}
 	if v, ok := req.Options.Metadata[stickyMetadataKeyDerived].(string); ok {
 		if v = strings.TrimSpace(v); v != "" {
-			return "derived:" + v
+			return providerName + "|derived:" + v
 		}
 	}
 	for _, name := range stickyExplicitHeaders {
 		if v := stickyHeaderValue(req.Options.Headers, name); v != "" {
-			return "hdr:" + strings.ToLower(name) + ":" + v
+			return providerName + "|hdr:" + strings.ToLower(name) + ":" + v
 		}
 	}
 	return ""

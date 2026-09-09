@@ -149,9 +149,14 @@ func storeDynamicModelsFail() {
 }
 
 // fetchDynamicModels 从凭证拉模型表；优先返回动态缓存，内存态回退静态表。
+// 负缓存命中（近期探测失败）时必须回退静态表——返回 nil 会让宿主把该账号的
+// 模型全部注销 1h（empty list → UnregisterClient），所有 Trae 模型 400。
 func fetchDynamicModels(sa *traeAuth) []pluginapi.ModelInfo {
 	if models, ok := cachedDynamicModels(); ok {
-		return models
+		if len(models) > 0 {
+			return models
+		}
+		return traeStaticModels()
 	}
 	if !modelsTrackingEnabled() {
 		return traeStaticModels()

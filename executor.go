@@ -120,12 +120,23 @@ func handleExecStream(raw []byte) (resp []byte, err error) {
 
 	// 无异步流 id → 同步收集 chunk 后一次返回。
 	if req.StreamID == "" {
-		chunks, status, respBody, collErr := collectUpstreamChunks(sa, body, sseFramed)
+		chunks, _, _, collErr := collectUpstreamChunks(sa, body, sseFramed)
 		if collErr != nil {
+			// 与异步路径同口径：HTTP 状态错误与流内业务错误（如 1005）
+			// 都要记账/冷却/禁用，否则坏账号会被反复打。
+			var se *SOLOStreamError
+			if errors.As(collErr, &se) {
+				reconcileAfterStreamError(req.AuthID, sa, se)
+				return nil, collErr
+			}
+			var httpErr *httpStatusError
+			if errors.As(collErr, &httpErr) {
+				reconcileAfterUpstreamError(req.AuthID, sa, httpErr.Status, httpErr.Body)
+			} else {
+				noteAccountError(req.AuthID, sa, 0, collErr.Error())
+			}
 			return nil, collErr
 		}
-		_ = status
-		_ = respBody
 		noteAccountSuccess(req.AuthID, sa)
 		return okEnvelope(streamResponse{Headers: headers, Chunks: chunks})
 	}
@@ -182,6 +193,16 @@ func pumpSoloStream(req executorStreamRequest, sa *traeAuth, body []byte, sseFra
 	noteAccountSuccess(req.AuthID, sa)
 }
 
+// httpStatusError 携带上游 HTTP 状态与响应体，供同步流路径做生命周期记账。
+type httpStatusError struct {
+	Status int
+	Body   string
+}
+
+func (e *httpStatusError) Error() string {
+	return fmt.Sprintf("upstream %d: %s", e.Status, truncateRedacted(e.Body, 200))
+}
+
 // collectUpstreamChunks 同步收集上游 SSE → OpenAI chunk（无 stream id 路径）。
 func collectUpstreamChunks(sa *traeAuth, body []byte, sseFramed bool) ([]pluginapi.ExecutorStreamChunk, int, []byte, error) {
 	rc, status, respBody, err := currentClient().ChatStream(sa, body)
@@ -190,7 +211,8 @@ func collectUpstreamChunks(sa *traeAuth, body []byte, sseFramed bool) ([]plugina
 	}
 	defer rc.Close()
 	if status >= 400 {
-		return nil, status, respBody, fmt.Errorf("upstream %d: %s", status, truncateRedacted(string(respBody), 200))
+		se := &httpStatusError{Status: status, Body: string(respBody)}
+		return nil, status, respBody, se
 	}
 	frames, streamErr := collectOpenAISSEChunks(rc, nil)
 	rc.Close()

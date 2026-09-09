@@ -185,10 +185,15 @@ func authFileJSON(nestedRaw []byte, disabled bool) ([]byte, error) {
 }
 
 // persistAuth 把凭证写回宿主（文件名按 UID 派生）。
+// disabled 参数同时更新内存态（marshalNested 序列化 a.Disabled），
+// 否则宿主凭证里的 disabled 标记会在下次任意写盘时被抹回 false。
 func persistAuth(sa *traeAuth, disabled bool) error {
 	if sa == nil {
 		return fmt.Errorf("nil auth")
 	}
+	sa.mu.Lock()
+	sa.Disabled = disabled
+	sa.mu.Unlock()
 	nested, err := sa.marshalNested()
 	if err != nil {
 		return err
