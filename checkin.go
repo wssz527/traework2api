@@ -77,15 +77,28 @@ func checkinOneAccount(f pluginapi.HostAuthFileEntry) map[string]any {
 		out["reason"] = "disabled"
 		out["message"] = "checkin disabled by upstream"
 	} else {
-		if err := currentClient().CheckinClaim(sa); err != nil {
-			if isAlreadyCheckedIn(err.Error()) {
+		claimErr := currentClient().CheckinClaim(sa)
+		if claimErr != nil && isCheckinRiskControl(claimErr.Error()) {
+			// 9074：「账号 + 设备指纹」组合被上游风控标记（报错文案是
+			// "当前参与用户太多，请稍后再试"，与额度/并发无关）。
+			// 换一个新的伪造设备 ID 落盘后重试一次。
+			sa.CheckinDeviceID = newFakeCheckinID()
+			if perr := persistAuth(sa, false); perr != nil {
+				out["device_id_error"] = perr.Error()
+			} else {
+				out["device_id_rotated"] = true
+			}
+			claimErr = currentClient().CheckinClaim(sa)
+		}
+		if claimErr != nil {
+			if isAlreadyCheckedIn(claimErr.Error()) {
 				out["success"] = true
 				out["skipped"] = true
 				out["reason"] = "already"
-				out["message"] = err.Error()
+				out["message"] = claimErr.Error()
 			} else {
 				out["success"] = false
-				out["error"] = redactSecrets(err.Error())
+				out["error"] = redactSecrets(claimErr.Error())
 			}
 		} else {
 			verified, _, _, verr := currentClient().CheckinStatus(sa)
@@ -133,6 +146,13 @@ func unfreezeIfCooled(authID string, sa *traeAuth) {
 		return
 	}
 	st.mu.Unlock()
+}
+
+// isCheckinRiskControl 识别签到风控错误（code=9074，文案
+// "当前参与用户太多，请稍后再试"）。该错误与额度/并发无关，实际含义是
+// 「账号 + 设备指纹」组合被标记，换新设备 ID 后重试即可恢复。
+func isCheckinRiskControl(msg string) bool {
+	return strings.Contains(msg, "9074") || strings.Contains(msg, "当前参与用户太多")
 }
 
 // isAlreadyCheckedIn 已签判定：仅匹配明确表示"今日已签到"的业务错误。

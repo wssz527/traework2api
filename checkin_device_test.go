@@ -108,3 +108,24 @@ func TestDetectLocalCheckinDeviceDisabled(t *testing.T) {
 
 // fakeDeviceIDRe 在本包已定义；这里再断言一次格式常量，防止被误改成非数字。
 var _ = regexp.MustCompile(`^\d{16}$`)
+
+// TestIsCheckinRiskControl 9074（"当前参与用户太多"）是设备指纹风控，
+// 必须被识别为可换 ID 重试的错误；普通业务错误不得误判。
+func TestIsCheckinRiskControl(t *testing.T) {
+	cases := []struct {
+		msg  string
+		want bool
+	}{
+		{"checkin claim: code=9074 message=当前参与用户太多，请稍后再试", true},
+		{"code=9074", true},
+		{"当前参与用户太多，请稍后再试", true},
+		{"checkin claim: code=9095 message=同一设备已签到", false},
+		{"今日已签到", false},
+		{"connection refused", false},
+	}
+	for _, c := range cases {
+		if got := isCheckinRiskControl(c.msg); got != c.want {
+			t.Errorf("isCheckinRiskControl(%q) = %v, want %v", c.msg, got, c.want)
+		}
+	}
+}
