@@ -81,8 +81,8 @@ func checkinOneAccount(f pluginapi.HostAuthFileEntry) map[string]any {
 		if claimErr != nil && isCheckinRiskControl(claimErr.Error()) {
 			// 9074：「账号 + 设备指纹」组合被上游风控标记（报错文案是
 			// "当前参与用户太多，请稍后再试"，与额度/并发无关）。
-			// 换一个新的伪造设备 ID 落盘后重试一次。
-			sa.CheckinDeviceID = newFakeCheckinID()
+			// 整套换一台伪造整机（新 ID + 随机 brand/type）落盘后重试一次。
+			rotateCheckinDevice(sa)
 			if perr := persistAuth(sa, false); perr != nil {
 				out["device_id_error"] = perr.Error()
 			} else {

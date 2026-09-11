@@ -129,3 +129,33 @@ func TestIsCheckinRiskControl(t *testing.T) {
 		}
 	}
 }
+
+// TestRotateCheckinDevice 轮换必须给出合法的新整机：16 位数字 ID、
+// brand/type 来自伪造整机池、且 ID 与旧值不同。
+func TestRotateCheckinDevice(t *testing.T) {
+	a := &traeAuth{UID: "u", CheckinDeviceID: "5496608371750480", CheckinDeviceBrand: "Mac16,10", CheckinDeviceType: "mac"}
+	seen := map[string]bool{}
+	for i := 0; i < 30; i++ {
+		old := a.CheckinDeviceID
+		rotateCheckinDevice(a)
+		if !fakeDeviceIDRe.MatchString(a.CheckinDeviceID) {
+			t.Fatalf("rotated id not 16 digits: %q", a.CheckinDeviceID)
+		}
+		if a.CheckinDeviceID == old {
+			t.Fatalf("id unchanged after rotation: %q", old)
+		}
+		ok := false
+		for _, m := range fakeCheckinMachinePool {
+			if a.CheckinDeviceBrand == m.brand && a.CheckinDeviceType == m.typ {
+				ok = true
+			}
+		}
+		if !ok {
+			t.Fatalf("brand/type not from pool: %q/%q", a.CheckinDeviceBrand, a.CheckinDeviceType)
+		}
+		seen[a.CheckinDeviceBrand] = true
+	}
+	if len(seen) < 2 {
+		t.Fatalf("pool not exercised across 30 rotations: %v", seen)
+	}
+}

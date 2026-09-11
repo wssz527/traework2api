@@ -171,6 +171,33 @@ func localBrandType() (brand, typ string) {
 	return brand, typ
 }
 
+// fakeCheckinMachinePool 伪造整机池：轮换签到设备时整套随机选取
+// （brand 与官方客户端上报值同构——mac 是 hw.model，windows 是主板型号）。
+// 换整机而不是只换 ID：账号在不同平台有多台设备是常态，上游无从交叉验证。
+var fakeCheckinMachinePool = []struct{ brand, typ string }{
+	{"Mac16,10", "mac"},
+	{"Mac15,7", "mac"},
+	{"Mac14,3", "mac"},
+	{"Mac16,1", "mac"},
+	{"B760M MORTAR MAX WIFI", "windows"},
+	{"TUF GAMING B650M-PLUS", "windows"},
+	{"MS-7E06", "windows"},
+}
+
+// rotateCheckinDevice 9074 风控时整套更换签到设备指纹：新 16 位数字 ID +
+// 随机整机 brand/type（尽量避开与当前相同的组合）。返回是否更换成功。
+func rotateCheckinDevice(a *traeAuth) bool {
+	a.CheckinDeviceID = newFakeCheckinID()
+	idx := 0
+	if rb := make([]byte, 1); func() bool { _, err := rand.Read(rb); return err == nil }() {
+		idx = int(rb[0]) % len(fakeCheckinMachinePool)
+	}
+	m := fakeCheckinMachinePool[idx]
+	a.CheckinDeviceBrand = m.brand
+	a.CheckinDeviceType = m.typ
+	return true
+}
+
 // EnsurePerAccountCheckinDevice 为账号确保一个固定的、独立于其它账号的
 // 签到设备三件套。返回是否写入了新设备标识（调用方据此落盘）。
 func EnsurePerAccountCheckinDevice(a *traeAuth) (changed bool) {
