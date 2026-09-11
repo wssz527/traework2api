@@ -337,17 +337,18 @@ function creditsOf(a){
 function pbColor(pct){var c='var(--ok)';if(pct>60)c='var(--warn)';if(pct>85)c='var(--err)';return c}
 function whenText(fetched){return fetched?(' · 快照 '+esc(String(fetched).replace('T',' ').replace('Z',' UTC'))):''}
 // progressHTML 卡片用量条：可用 X / 已用 Y · Z% + 进度条 + 明细行（同 workbuddy）。
+// 口径为「通用积分」：Work 专属积分（仅 TraeWork 可用）已在后端排除。
 function progressHTML(c){
   if(!c||!c.known){
-    return '<div class="pb"><div class="pb-label"><span>可用积分</span><span><span class="spin"></span>加载中…</span></div>'+
+    return '<div class="pb"><div class="pb-label"><span>可用通用积分</span><span><span class="spin"></span>加载中…</span></div>'+
            '<div class="pb-track"><div class="pb-bar" style="width:0%"></div></div></div>';
   }
   var total=c.size>0?c.size:(c.remain+c.used);
   var pct=total>0?Math.round(c.used/total*100):0;
   return '<div class="pb">'+
-    '<div class="pb-label"><span>可用 '+c.remain+'</span><span>已用 '+c.used+' · '+pct+'%</span></div>'+
+    '<div class="pb-label"><span>可用通用积分 '+c.remain+'</span><span>已用 '+c.used+' · '+pct+'%</span></div>'+
     '<div class="pb-track"><div class="pb-bar" style="width:'+pct+'%;background:'+pbColor(pct)+'"></div></div>'+
-    '<div class="pb-meta">剩余 '+c.remain+' · 已用 '+c.used+' · 额度池 '+total+
+    '<div class="pb-meta">剩余 '+c.remain+' · 已用 '+c.used+' · 通用积分池 '+total+
       (c.packs?(' · '+c.packs+' 个包'):'')+whenText(c.fetched)+
     '</div></div>';
 }
@@ -485,15 +486,15 @@ function renderSummary(accounts){
       '<div class="summary-item"><div class="k">已禁用</div><div class="v">'+disN+'</div></div>'+
     '</div>'+
     '<div class="summary-grid">'+
-      '<div class="summary-item"><div class="k">剩余(可用)</div><div class="v ok">'+remain+'</div></div>'+
-      '<div class="summary-item"><div class="k">已用(消耗)</div><div class="v '+pbCls+'">'+used+'</div></div>'+
-      '<div class="summary-item"><div class="k">额度池</div><div class="v">'+(pool||'—')+'</div></div>'+
+      '<div class="summary-item"><div class="k">剩余(通用)</div><div class="v ok">'+remain+'</div></div>'+
+      '<div class="summary-item"><div class="k">已用(通用)</div><div class="v '+pbCls+'">'+used+'</div></div>'+
+      '<div class="summary-item"><div class="k">通用积分池</div><div class="v">'+(pool||'—')+'</div></div>'+
       '<div class="summary-item"><div class="k">消耗占比</div><div class="v '+(pool?(usedPct>85?"err":(usedPct>60?"warn":"ok")):"")+'">'+(pool?usedPct+'%':'—')+'</div></div>'+
     '</div>'+
     '<div class="pb">'+
-      '<div class="pb-label"><span>消耗进度（已用/额度池）</span><span>'+(pool?usedPct+'%':'—')+'</span></div>'+
+      '<div class="pb-label"><span>消耗进度（已用/通用积分池）</span><span>'+(pool?usedPct+'%':'—')+'</span></div>'+
       '<div class="pb-track"><div class="pb-bar" style="width:'+(pool?usedPct:0)+'%;background:'+pbColor(usedPct)+'"></div></div>'+
-      '<div class="pb-meta">可用 '+remain+' · 已用 '+used+' · 池 '+pool+
+      '<div class="pb-meta">可用 '+remain+' · 已用 '+used+' · 通用积分池 '+pool+
         (packs?(' · '+packs+' 个包'):'')+
         '（签到加包会抬高池和可用，不等于没消耗）</div>'+
     '</div>'+

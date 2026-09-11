@@ -290,6 +290,34 @@ func TestUserEntUsageSubtractsUsed(t *testing.T) {
 	}
 }
 
+// TestUserEntUsageExcludesWorkExclusive 只统计通用积分：available_endpoint=1
+// 的 Work 专属积分不能计入（插件走 SOLO/Code 通道，用不上它）。
+func TestUserEntUsageExcludesWorkExclusive(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"user_entitlement_pack_list":[
+			{"entitlement_base_info":{"available_endpoint":0,"quota":{"credits_limit":2000}},"usage":{"credits_amount":500}},
+			{"entitlement_base_info":{"available_endpoint":1,"quota":{"credits_limit":4000}},"usage":{"credits_amount":0}},
+			{"entitlement_base_info":{"available_endpoint":0,"quota":{"credits_limit":500}},"usage":{"credits_amount":100}}
+		]}`), nil
+	})
+	u, err := c.UserEntUsage(fakeAuth())
+	if err != nil {
+		t.Fatalf("ent usage: %v", err)
+	}
+	if u.Limit != 2500 {
+		t.Errorf("limit=%d want 2500 (Work 专属 4000 不该计入)", u.Limit)
+	}
+	if u.Used != 600 {
+		t.Errorf("used=%d want 600", u.Used)
+	}
+	if u.Remain != 1900 {
+		t.Errorf("remain=%d want 1900", u.Remain)
+	}
+	if u.PackCount != 2 {
+		t.Errorf("pack_count=%d want 2 (只数通用积分包)", u.PackCount)
+	}
+}
+
 // TestUserEntUsageProgressRatio 面板进度条依赖 used/limit，不能只有 remain。
 func TestUserEntUsageProgressRatio(t *testing.T) {
 	c := testClient(func(r *http.Request) (*http.Response, error) {

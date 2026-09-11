@@ -436,6 +436,12 @@ func (c *Client) CheckinClaim(a *traeAuth) error {
 
 // UserEntUsage 聚合积分用量（ide_user_ent_usage）。
 //
+// 积分分两类（官方文档）：通用积分（available_endpoint=0，TraeCode 与
+// TraeWork 都可用）和 Work 专属积分（available_endpoint=1，仅 TraeWork
+// 可用）。插件走 SOLO/Code 通道，只能消耗通用积分——实测请求只扣 ep=0 的
+// 包，ep=1 分文未动。因此只聚合通用积分，面板/调度/冷却判定全部以通用
+// 积分为准，避免把用不上的 Work 积分算进余额。
+//
 // 剩余 = Σ(credits_limit) − Σ(usage.credits_amount)，钳到 >= 0；
 // used/limit/pack_count 一并返回，面板据此画用量进度条。
 func (c *Client) UserEntUsage(a *traeAuth) (entUsage, error) {
@@ -453,7 +459,8 @@ func (c *Client) UserEntUsage(a *traeAuth) (entUsage, error) {
 		IsCreditsBilling        bool `json:"is_credits_billing"`
 		UserEntitlementPackList []struct {
 			EntitlementBaseInfo struct {
-				Quota struct {
+				AvailableEndpoint int `json:"available_endpoint"`
+				Quota             struct {
 					CreditsLimit int64 `json:"credits_limit"`
 				} `json:"quota"`
 			} `json:"entitlement_base_info"`
@@ -466,14 +473,19 @@ func (c *Client) UserEntUsage(a *traeAuth) (entUsage, error) {
 		return zero, fmt.Errorf("ent usage parse: %w", err)
 	}
 	var limit, used float64
+	packs := 0
 	for _, p := range resp.UserEntitlementPackList {
+		if p.EntitlementBaseInfo.AvailableEndpoint != 0 {
+			continue // Work 专属积分，本通道不可用，不计入
+		}
 		limit += float64(p.EntitlementBaseInfo.Quota.CreditsLimit)
 		used += p.Usage.CreditsAmount
+		packs++
 	}
 	out := entUsage{
 		Used:      int64(used),
 		Limit:     int64(limit),
-		PackCount: len(resp.UserEntitlementPackList),
+		PackCount: packs,
 	}
 	out.Remain = int64(limit - used)
 	if out.Remain < 0 {

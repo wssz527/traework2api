@@ -218,6 +218,10 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return okEnvelope(identifierResponse{Identifier: providerName})
 	case pluginabi.MethodAuthParse:
 		return handleParseAuth(request)
+	case pluginabi.MethodAuthLoginStart:
+		return handleStartLogin(request)
+	case pluginabi.MethodAuthLoginPoll:
+		return handlePollLogin(request)
 	case pluginabi.MethodAuthRefresh:
 		return handleRefreshAuth(request)
 	case pluginabi.MethodExecutorIdentifier:
